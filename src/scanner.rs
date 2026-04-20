@@ -11,11 +11,18 @@ pub struct CommitRecord {
     pub subject: String,
     pub body: String,
     pub branch_at_head: String,
+    pub repo: String,
 }
 
 pub fn scan(repo_path: &Path, date: Option<NaiveDate>) -> Result<Vec<CommitRecord>> {
     let repo = Repository::open(repo_path)
         .with_context(|| format!("opening git repo at {}", repo_path.display()))?;
+
+    let repo_name = repo_path
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| repo_path.display().to_string());
 
     let me = repo
         .config()?
@@ -81,6 +88,7 @@ pub fn scan(repo_path: &Path, date: Option<NaiveDate>) -> Result<Vec<CommitRecor
                 subject,
                 body,
                 branch_at_head: branch_at_head.clone(),
+                repo: repo_name.clone(),
             });
         }
     }
