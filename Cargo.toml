@@ -2,6 +2,10 @@
 name = "dlog"
 version = "0.1.0"
 edition = "2024"
+description = "Personal git -> Jira daily logger (groups commits by ticket, pushes worklogs)"
+license = "MIT"
+repository = "https://github.com/xen0dermu3/dlog"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"
@@ -17,3 +21,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 walkdir = "2"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
