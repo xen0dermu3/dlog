@@ -21,6 +21,28 @@ works too.
 
 ## Usage
 
+### Interactive (TUI)
+
+```sh
+dlog
+```
+
+Launches a terminal UI with four screens:
+
+- **Home** — summary of configured repos and the selected date.
+  `[r]` repos  `[d]` date  `[s]` scan  `[q]` quit
+- **Repos** — edit the list of repos to scan. Config persists to
+  `~/Library/Application Support/dlog/config.toml`.
+  `[a]` add  `[x]` delete  `[↑/↓]` move  `[Esc]` back
+- **Date picker** — calendar. Cursor is cyan, today is underlined, previously
+  selected date is green.
+  `[←/→/↑/↓]` move  `[ [ ]` prev month  `[ ] ]` next month  `[t]` today
+  `[Enter]` select  `[Esc]` cancel
+- **Results** — groups-by-ticket table for the selected date across every
+  configured repo. `[Esc]` back.
+
+### Non-interactive (CLI — unchanged from step 2)
+
 ```
 dlog scan [PATHS...] [--date YYYY-MM-DD] [--with-prs]
 ```

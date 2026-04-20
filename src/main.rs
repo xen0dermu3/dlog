@@ -1,7 +1,10 @@
+mod config;
+mod fuzzy;
 mod pr;
 mod report;
 mod scanner;
 mod tickets;
+mod tui;
 
 use std::path::PathBuf;
 
@@ -15,7 +18,7 @@ use crate::pr::PrEnrichment;
 #[command(name = "dlog", version, about = "Personal git -> Jira daily logger")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -38,11 +41,12 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Scan {
+        None => tui::run(),
+        Some(Command::Scan {
             paths,
             date,
             with_prs,
-        } => {
+        }) => {
             let paths = if paths.is_empty() {
                 vec![PathBuf::from(".")]
             } else {
@@ -66,9 +70,8 @@ fn main() -> Result<()> {
             }
 
             all_records.sort_by_key(|r| r.author_time);
-
             report::print_grouped(&all_records, pr_merged.as_ref());
+            Ok(())
         }
     }
-    Ok(())
 }
