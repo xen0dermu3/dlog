@@ -8,24 +8,14 @@ standup summary.
 
 ### From a tagged release (no Rust required)
 
-macOS / Linux:
-
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/xen0dermu3/dlog/releases/latest/download/dlog-installer.sh | sh
 ```
 
-Windows (PowerShell):
-
-```powershell
-irm https://github.com/xen0dermu3/dlog/releases/latest/download/dlog-installer.ps1 | iex
-```
-
 Prebuilt binaries are published by
 [cargo-dist](https://opensource.axo.dev/cargo-dist/) on every git tag `v*`.
-Targets: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
-`aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`,
-`x86_64-pc-windows-msvc`.
+Targets: macOS (Apple Silicon + Intel) and Linux x86_64.
 
 ### From source (requires Rust)
 
