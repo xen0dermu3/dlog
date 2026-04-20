@@ -35,7 +35,7 @@ impl FuzzyIndex {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             for root in roots {
-                let walker = WalkDir::new(&root)
+                let mut it = WalkDir::new(&root)
                     .max_depth(MAX_DEPTH)
                     .follow_links(false)
                     .into_iter()
@@ -55,11 +55,22 @@ impl FuzzyIndex {
                         }
                         true
                     });
-                for entry in walker.flatten() {
-                    if entry.depth() > 0 && entry.file_type().is_dir() {
+                loop {
+                    let entry = match it.next() {
+                        Some(Ok(e)) => e,
+                        Some(Err(_)) => continue,
+                        None => break,
+                    };
+                    if entry.depth() == 0 || !entry.file_type().is_dir() {
+                        continue;
+                    }
+                    // `.git` can be a directory (normal repo) or a file (worktree
+                    // / submodule gitlink) — `.exists()` covers both.
+                    if entry.path().join(".git").exists() {
                         if tx.send(entry.path().to_path_buf()).is_err() {
                             return;
                         }
+                        it.skip_current_dir();
                     }
                 }
             }

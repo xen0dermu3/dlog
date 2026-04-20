@@ -13,7 +13,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::config::Config;
@@ -28,6 +28,7 @@ enum View {
     Repos,
     RepoAdd { error: Option<String> },
     Date,
+    Scanning,
     Results,
     Error(String),
 }
@@ -73,7 +74,22 @@ impl App {
 
     fn refresh_matches(&mut self) {
         if let Some(idx) = &mut self.fuzzy_index {
-            self.fuzzy_matches = idx.search(&self.input, FUZZY_LIMIT);
+            let configured: std::collections::HashSet<PathBuf> = self
+                .config
+                .repos
+                .iter()
+                .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+                .collect();
+            // Oversample so filtering still leaves ~FUZZY_LIMIT visible matches.
+            let raw = idx.search(&self.input, FUZZY_LIMIT * 4);
+            self.fuzzy_matches = raw
+                .into_iter()
+                .filter(|(p, _)| {
+                    let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+                    !configured.contains(&canon)
+                })
+                .take(FUZZY_LIMIT)
+                .collect();
             if self.fuzzy_selected >= self.fuzzy_matches.len() {
                 self.fuzzy_selected = self.fuzzy_matches.len().saturating_sub(1);
             }
@@ -124,6 +140,14 @@ fn event_loop<B: ratatui::backend::Backend>(
 
         terminal.draw(|f| render(f, app))?;
 
+        // If the user just asked to scan, the previous draw showed the
+        // Scanning view. Now actually run the scan (which blocks) and the
+        // next loop iteration draws the results.
+        if matches!(app.view, View::Scanning) {
+            run_scan(app);
+            continue;
+        }
+
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
@@ -145,6 +169,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         View::Repos => handle_repos(app, key),
         View::RepoAdd { .. } => handle_repo_add(app, key),
         View::Date => handle_date(app, key),
+        View::Scanning => Ok(false), // no input accepted during scan
         View::Results => {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                 app.view = View::Home;
@@ -166,7 +191,13 @@ fn handle_home(app: &mut App, key: KeyEvent) -> Result<bool> {
             app.date_cursor = app.selected_date;
             app.view = View::Date;
         }
-        KeyCode::Char('s') => run_scan(app),
+        KeyCode::Char('s') => {
+            if app.config.repos.is_empty() {
+                app.view = View::Error("No repos configured. Press 'r' to add one.".into());
+            } else {
+                app.view = View::Scanning;
+            }
+        }
         _ => {}
     }
     Ok(false)
@@ -375,9 +406,40 @@ fn render(f: &mut Frame, app: &App) {
         View::Repos => render_repos(f, app),
         View::RepoAdd { error } => render_repo_add(f, app, error.as_deref()),
         View::Date => render_date(f, app),
+        View::Scanning => render_scanning(f, app),
         View::Results => render_results(f, app),
         View::Error(msg) => render_error(f, msg),
     }
+}
+
+fn render_scanning(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let block = Block::default()
+        .title(" scanning ")
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let n = app.config.repos.len();
+    let date = app.selected_date.format("%Y-%m-%d").to_string();
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "  scanning {n} repo{} for {date}...",
+                if n == 1 { "" } else { "s" }
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for path in &app.config.repos {
+        lines.push(Line::from(Span::styled(
+            format!("    {}", path.display()),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn render_home(f: &mut Frame, app: &App) {
@@ -481,9 +543,9 @@ fn render_repo_add(f: &mut Frame, app: &App, error: Option<&str>) {
     } else if let Some(idx) = &app.fuzzy_index {
         let n = idx.len();
         let text = if idx.done() {
-            format!("  {n} dirs indexed")
+            format!("  {n} git repo{} indexed", if n == 1 { "" } else { "s" })
         } else {
-            format!("  scanning... {n} dirs")
+            format!("  scanning... {n} git repo{} so far", if n == 1 { "" } else { "s" })
         };
         Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
     } else {
@@ -632,7 +694,7 @@ fn render_results(f: &mut Frame, app: &App) {
     let groups = report::group_commits(&app.scan_records, None);
     let lines = lines_for_groups(&groups, &app.scan_records);
 
-    let para = Paragraph::new(Text::from(lines));
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
 
     let hint = Paragraph::new(Line::from("[Esc] back")).dim();
@@ -661,6 +723,7 @@ fn lines_for_groups<'a>(
             header,
             Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
         )));
+        let body_indent = " ".repeat(2 + 1 + repo_w + 1 + 2 + 5 + 2 + 7 + 2);
         for c in commits {
             let hm = chrono::Local
                 .timestamp_opt(c.author_time, 0)
@@ -677,6 +740,15 @@ fn lines_for_groups<'a>(
                 w = repo_w
             );
             lines.push(Line::from(row));
+            for body_line in c.body.lines() {
+                if body_line.trim().is_empty() {
+                    continue;
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("{}{}", body_indent, body_line),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
         }
     }
     lines
