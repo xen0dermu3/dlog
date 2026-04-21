@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -44,10 +45,18 @@ struct App {
     date_cursor: NaiveDate,
 
     scan_records: Vec<CommitRecord>,
+    scan_cache: HashMap<(NaiveDate, Vec<PathBuf>), Vec<CommitRecord>>,
+    results_are_cached: bool,
 
     fuzzy_index: Option<FuzzyIndex>,
     fuzzy_matches: Vec<(PathBuf, String)>,
     fuzzy_selected: usize,
+}
+
+fn cache_key(date: NaiveDate, repos: &[PathBuf]) -> (NaiveDate, Vec<PathBuf>) {
+    let mut r = repos.to_vec();
+    r.sort();
+    (date, r)
 }
 
 impl App {
@@ -66,6 +75,8 @@ impl App {
             input: String::new(),
             date_cursor: today,
             scan_records: Vec::new(),
+            scan_cache: HashMap::new(),
+            results_are_cached: false,
             fuzzy_index: None,
             fuzzy_matches: Vec::new(),
             fuzzy_selected: 0,
@@ -195,6 +206,22 @@ fn handle_home(app: &mut App, key: KeyEvent) -> Result<bool> {
             if app.config.repos.is_empty() {
                 app.view = View::Error("No repos configured. Press 'r' to add one.".into());
             } else {
+                let key = cache_key(app.selected_date, &app.config.repos);
+                if let Some(cached) = app.scan_cache.get(&key) {
+                    app.scan_records = cached.clone();
+                    app.results_are_cached = true;
+                    app.view = View::Results;
+                } else {
+                    app.view = View::Scanning;
+                }
+            }
+        }
+        KeyCode::Char('S') => {
+            if app.config.repos.is_empty() {
+                app.view = View::Error("No repos configured. Press 'r' to add one.".into());
+            } else {
+                let key = cache_key(app.selected_date, &app.config.repos);
+                app.scan_cache.remove(&key);
                 app.view = View::Scanning;
             }
         }
@@ -371,7 +398,10 @@ fn run_scan(app: &mut App) {
         }
     }
     all.sort_by_key(|r| r.author_time);
+    let key = cache_key(app.selected_date, &app.config.repos);
+    app.scan_cache.insert(key, all.clone());
     app.scan_records = all;
+    app.results_are_cached = false;
     app.view = View::Results;
 }
 
@@ -469,7 +499,7 @@ fn render_home(f: &mut Frame, app: &App) {
         Line::from(""),
         Line::from("  [r] edit repos").dim(),
         Line::from("  [d] pick date").dim(),
-        Line::from("  [s] scan").dim(),
+        Line::from("  [s] scan (cached)   [S] rescan").dim(),
         Line::from("  [q] quit").dim(),
     ];
     let para = Paragraph::new(Text::from(lines));
@@ -682,12 +712,15 @@ fn render_results(f: &mut Frame, app: &App) {
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
-    let block = Block::default()
-        .title(format!(
-            " results — {} ",
+    let title = if app.results_are_cached {
+        format!(
+            " results — {} (cached — shift+S to rescan) ",
             app.selected_date.format("%Y-%m-%d")
-        ))
-        .borders(Borders::ALL);
+        )
+    } else {
+        format!(" results — {} ", app.selected_date.format("%Y-%m-%d"))
+    };
+    let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(chunks[0]);
     f.render_widget(block, chunks[0]);
 

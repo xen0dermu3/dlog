@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use chrono::{Local, NaiveDate};
 use git2::{BranchType, Repository, Sort};
 
+#[derive(Clone)]
 pub struct CommitRecord {
     pub oid: String,
     pub author_time: i64,
