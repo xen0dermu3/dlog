@@ -19,7 +19,8 @@ use ratatui::{Frame, Terminal};
 
 use crate::config::Config;
 use crate::fuzzy::{self, FuzzyIndex};
-use crate::report::{self, Group};
+use crate::hours::{format_hours, parse_duration};
+use crate::report::{self, GroupSummary};
 use crate::scanner::{self, CommitRecord};
 
 const FUZZY_LIMIT: usize = 8;
@@ -47,6 +48,9 @@ struct App {
     scan_records: Vec<CommitRecord>,
     scan_cache: HashMap<(NaiveDate, Vec<PathBuf>), Vec<CommitRecord>>,
     results_are_cached: bool,
+    results_selected: usize,
+    results_edit: Option<String>,
+    hours_overrides: HashMap<String, f32>,
 
     fuzzy_index: Option<FuzzyIndex>,
     fuzzy_matches: Vec<(PathBuf, String)>,
@@ -77,6 +81,9 @@ impl App {
             scan_records: Vec::new(),
             scan_cache: HashMap::new(),
             results_are_cached: false,
+            results_selected: 0,
+            results_edit: None,
+            hours_overrides: HashMap::new(),
             fuzzy_index: None,
             fuzzy_matches: Vec::new(),
             fuzzy_selected: 0,
@@ -181,12 +188,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         View::RepoAdd { .. } => handle_repo_add(app, key),
         View::Date => handle_date(app, key),
         View::Scanning => Ok(false), // no input accepted during scan
-        View::Results => {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-                app.view = View::Home;
-            }
-            Ok(false)
-        }
+        View::Results => handle_results(app, key),
         View::Error(_) => {
             app.view = View::Home;
             Ok(false)
@@ -210,6 +212,8 @@ fn handle_home(app: &mut App, key: KeyEvent) -> Result<bool> {
                 if let Some(cached) = app.scan_cache.get(&key) {
                     app.scan_records = cached.clone();
                     app.results_are_cached = true;
+                    app.results_selected = 0;
+                    app.results_edit = None;
                     app.view = View::Results;
                 } else {
                     app.view = View::Scanning;
@@ -222,6 +226,7 @@ fn handle_home(app: &mut App, key: KeyEvent) -> Result<bool> {
             } else {
                 let key = cache_key(app.selected_date, &app.config.repos);
                 app.scan_cache.remove(&key);
+                app.hours_overrides.clear();
                 app.view = View::Scanning;
             }
         }
@@ -346,6 +351,9 @@ fn handle_date(app: &mut App, key: KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Esc => app.view = View::Home,
         KeyCode::Enter => {
+            if app.selected_date != app.date_cursor {
+                app.hours_overrides.clear();
+            }
             app.selected_date = app.date_cursor;
             app.view = View::Home;
         }
@@ -382,6 +390,60 @@ fn shift_month(app: &mut App, delta: i32) {
     }
 }
 
+fn handle_results(app: &mut App, key: KeyEvent) -> Result<bool> {
+    if let Some(buf) = &mut app.results_edit {
+        match key.code {
+            KeyCode::Esc => {
+                app.results_edit = None;
+            }
+            KeyCode::Enter => {
+                if let Some(v) = parse_duration(buf) {
+                    let groups = report::group_with_hours(&app.scan_records, None);
+                    if let Some(g) = groups.get(app.results_selected) {
+                        app.hours_overrides.insert(g.ticket.clone(), v);
+                    }
+                    app.results_edit = None;
+                }
+                // Unparseable input keeps the user in edit mode so they can fix it.
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Char(c)
+                if c.is_ascii_digit()
+                    || matches!(c, '.' | 'h' | 'H' | 'm' | 'M' | ' ') =>
+            {
+                buf.push(c);
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.view = View::Home;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let n = report::group_with_hours(&app.scan_records, None).len();
+            if n > 0 {
+                app.results_selected = (app.results_selected + 1) % n;
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            let n = report::group_with_hours(&app.scan_records, None).len();
+            if n > 0 {
+                app.results_selected = (app.results_selected + n - 1) % n;
+            }
+        }
+        KeyCode::Char('e') => {
+            app.results_edit = Some(String::new());
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
 fn run_scan(app: &mut App) {
     if app.config.repos.is_empty() {
         app.view = View::Error("No repos configured. Press 'r' to add one.".into());
@@ -402,6 +464,8 @@ fn run_scan(app: &mut App) {
     app.scan_cache.insert(key, all.clone());
     app.scan_records = all;
     app.results_are_cached = false;
+    app.results_selected = 0;
+    app.results_edit = None;
     app.view = View::Results;
 }
 
@@ -724,19 +788,25 @@ fn render_results(f: &mut Frame, app: &App) {
     let inner = block.inner(chunks[0]);
     f.render_widget(block, chunks[0]);
 
-    let groups = report::group_commits(&app.scan_records, None);
-    let lines = lines_for_groups(&groups, &app.scan_records);
+    let groups = report::group_with_hours(&app.scan_records, None);
+    let lines = lines_for_summaries(&groups, &app.scan_records, app);
 
     let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
 
-    let hint = Paragraph::new(Line::from("[Esc] back")).dim();
+    let hint_text = if app.results_edit.is_some() {
+        "type e.g. 30m, 2h, 2h 30m   [Enter] save   [Esc] cancel"
+    } else {
+        "[↑/↓] select   [e] change time   [Esc] back"
+    };
+    let hint = Paragraph::new(Line::from(hint_text)).dim();
     f.render_widget(hint, chunks[1]);
 }
 
-fn lines_for_groups<'a>(
-    groups: &[Group<'a>],
+fn lines_for_summaries(
+    groups: &[GroupSummary<'_>],
     all_records: &[CommitRecord],
+    app: &App,
 ) -> Vec<Line<'static>> {
     if all_records.is_empty() {
         return vec![Line::from(Span::styled(
@@ -746,33 +816,75 @@ fn lines_for_groups<'a>(
     }
     let repo_w = all_records.iter().map(|r| r.repo.len()).max().unwrap_or(0);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (i, (name, commits)) in groups.iter().enumerate() {
+    let mut total: f32 = 0.0;
+
+    for (i, g) in groups.iter().enumerate() {
         if i > 0 {
             lines.push(Line::from(""));
         }
-        let n = commits.len();
-        let header = format!("{} ({} commit{})", name, n, if n == 1 { "" } else { "s" });
+        let selected = i == app.results_selected;
+        let marker = if selected { "> " } else { "  " };
+        let n = g.commits.len();
+
+        let (header_text, value) = if selected && app.results_edit.is_some() {
+            let buf = app.results_edit.as_deref().unwrap_or("");
+            (
+                format!("{marker}{} — edit: {buf}_", g.ticket),
+                app.hours_overrides
+                    .get(&g.ticket)
+                    .copied()
+                    .unwrap_or(g.gap.value),
+            )
+        } else if let Some(ov) = app.hours_overrides.get(&g.ticket) {
+            (
+                format!(
+                    "{marker}{} — {} (manual)",
+                    g.ticket,
+                    format_hours(*ov)
+                ),
+                *ov,
+            )
+        } else {
+            (
+                format!("{marker}{} — {}", g.ticket, g.gap.display()),
+                g.gap.value,
+            )
+        };
+        total += value;
+
+        let header_style = if selected {
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        };
+        lines.push(Line::from(Span::styled(header_text, header_style)));
+
         lines.push(Line::from(Span::styled(
-            header,
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            format!("  {}", report::subtitle(n, g.span.value)),
+            Style::default().fg(Color::DarkGray),
         )));
+
         let body_indent = " ".repeat(2 + 1 + repo_w + 1 + 2 + 5 + 2 + 7 + 2);
-        for c in commits {
-            let hm = chrono::Local
+        for c in &g.commits {
+            let hm = Local
                 .timestamp_opt(c.author_time, 0)
                 .single()
                 .map(|dt| dt.format("%H:%M").to_string())
                 .unwrap_or_else(|| "--:--".to_string());
             let short = c.oid[..7.min(c.oid.len())].to_string();
-            let row = format!(
+            lines.push(Line::from(format!(
                 "  [{:<w$}]  {}  {}  {}",
                 c.repo,
                 hm,
                 short,
                 c.subject,
                 w = repo_w
-            );
-            lines.push(Line::from(row));
+            )));
             for body_line in c.body.lines() {
                 if body_line.trim().is_empty() {
                     continue;
@@ -784,6 +896,14 @@ fn lines_for_groups<'a>(
             }
         }
     }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("Total: {}", format_hours(total)),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
     lines
 }
 

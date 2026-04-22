@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use chrono::{Local, TimeZone};
 
+use crate::hours::{format_hours, CommitGap, FirstToLast, Hours, HoursEstimator};
 use crate::pr::PrEnrichment;
 use crate::scanner::CommitRecord;
 use crate::tickets;
@@ -9,6 +10,13 @@ use crate::tickets;
 pub const UNTAGGED: &str = "(untagged)";
 
 pub type Group<'a> = (String, Vec<&'a CommitRecord>);
+
+pub struct GroupSummary<'a> {
+    pub ticket: String,
+    pub commits: Vec<&'a CommitRecord>,
+    pub gap: Hours,
+    pub span: Hours,
+}
 
 pub fn group_commits<'a>(
     records: &'a [CommitRecord],
@@ -47,6 +55,39 @@ pub fn group_commits<'a>(
     tagged
 }
 
+pub fn group_with_hours<'a>(
+    records: &'a [CommitRecord],
+    pr: Option<&PrEnrichment>,
+) -> Vec<GroupSummary<'a>> {
+    let gap = CommitGap::default();
+    let span = FirstToLast;
+    group_commits(records, pr)
+        .into_iter()
+        .map(|(ticket, commits)| {
+            let gap_h = gap.estimate(&commits);
+            let span_h = span.estimate(&commits);
+            GroupSummary {
+                ticket,
+                commits,
+                gap: gap_h,
+                span: span_h,
+            }
+        })
+        .collect()
+}
+
+/// One-line natural-language description of a group's commit count and
+/// wall-clock span. Shared by CLI and TUI renderers.
+pub fn subtitle(n: usize, elapsed_hours: f32) -> String {
+    if n == 1 {
+        "1 commit".to_string()
+    } else if elapsed_hours > 0.0 {
+        format!("{n} commits across {}", format_hours(elapsed_hours))
+    } else {
+        format!("{n} commits")
+    }
+}
+
 pub fn print_grouped(records: &[CommitRecord], pr: Option<&PrEnrichment>) {
     if records.is_empty() {
         println!("(no matching commits)");
@@ -54,15 +95,19 @@ pub fn print_grouped(records: &[CommitRecord], pr: Option<&PrEnrichment>) {
     }
 
     let repo_width = records.iter().map(|r| r.repo.len()).max().unwrap_or(0);
-    let groups = group_commits(records, pr);
+    let groups = group_with_hours(records, pr);
 
-    for (i, (name, commits)) in groups.iter().enumerate() {
+    let mut total: f32 = 0.0;
+
+    for (i, group) in groups.iter().enumerate() {
         if i > 0 {
             println!();
         }
-        let n = commits.len();
-        println!("{} ({} commit{})", name, n, if n == 1 { "" } else { "s" });
-        for c in commits {
+        let n = group.commits.len();
+        println!("{} — {}", group.ticket, group.gap.display());
+        println!("  {}", subtitle(n, group.span.value));
+        total += group.gap.value;
+        for c in &group.commits {
             let hm = Local
                 .timestamp_opt(c.author_time, 0)
                 .single()
@@ -79,4 +124,7 @@ pub fn print_grouped(records: &[CommitRecord], pr: Option<&PrEnrichment>) {
             );
         }
     }
+
+    println!();
+    println!("Total: {}", format_hours(total));
 }

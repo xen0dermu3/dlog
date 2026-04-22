@@ -1,5 +1,6 @@
 mod config;
 mod fuzzy;
+mod hours;
 mod pr;
 mod report;
 mod scanner;
