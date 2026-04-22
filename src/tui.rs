@@ -347,13 +347,13 @@ fn handle_middle(app: &mut App, key: KeyEvent) {
 fn handle_right(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Down | KeyCode::Char('j') => {
-            let n = report::group_with_hours(&app.scan_records, None).len();
+            let n = report::group_with_hours(&app.scan_records).len();
             if n > 0 {
                 app.results_selected = (app.results_selected + 1) % n;
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            let n = report::group_with_hours(&app.scan_records, None).len();
+            let n = report::group_with_hours(&app.scan_records).len();
             if n > 0 {
                 app.results_selected = (app.results_selected + n - 1) % n;
             }
@@ -448,7 +448,7 @@ fn handle_edit_hours(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             if let Some(v) = parse_duration(buf) {
-                let groups = report::group_with_hours(&app.scan_records, None);
+                let groups = report::group_with_hours(&app.scan_records);
                 if let Some(g) = groups.get(app.results_selected) {
                     app.hours_overrides.insert(g.ticket.clone(), v);
                 }
@@ -929,7 +929,7 @@ fn render_right_pane(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let groups = report::group_with_hours(&app.scan_records, None);
+    let groups = report::group_with_hours(&app.scan_records);
     let (lines, group_line_offsets) = lines_for_summaries(&groups, &app.scan_records, app);
 
     // Auto-scroll to keep the selected group's header inside the view.
