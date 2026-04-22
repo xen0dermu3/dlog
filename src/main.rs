@@ -10,7 +10,7 @@ mod tui;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use chrono::NaiveDate;
+use chrono::{Local, NaiveDate};
 use clap::{Parser, Subcommand};
 
 use crate::pr::PrEnrichment;
@@ -56,9 +56,10 @@ fn main() -> Result<()> {
 
             let mut all_records = Vec::new();
             let mut pr_merged: Option<PrEnrichment> = None;
+            let target = date.unwrap_or_else(|| Local::now().date_naive());
 
             for path in &paths {
-                let mut records = scanner::scan(path, date)?;
+                let mut records = scanner::scan(path, target, target)?;
                 all_records.append(&mut records);
 
                 if with_prs {

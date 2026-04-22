@@ -15,7 +15,11 @@ pub struct CommitRecord {
     pub repo: String,
 }
 
-pub fn scan(repo_path: &Path, date: Option<NaiveDate>) -> Result<Vec<CommitRecord>> {
+pub fn scan(
+    repo_path: &Path,
+    start_date: NaiveDate,
+    end_date_inclusive: NaiveDate,
+) -> Result<Vec<CommitRecord>> {
     let repo = Repository::open(repo_path)
         .with_context(|| format!("opening git repo at {}", repo_path.display()))?;
 
@@ -30,17 +34,16 @@ pub fn scan(repo_path: &Path, date: Option<NaiveDate>) -> Result<Vec<CommitRecor
         .get_string("user.email")
         .context("reading user.email from git config")?;
 
-    let target = date.unwrap_or_else(|| Local::now().date_naive());
-    let start = target
+    let start = start_date
         .and_hms_opt(0, 0, 0)
         .unwrap()
         .and_local_timezone(Local)
         .single()
         .context("resolving start-of-day")?
         .timestamp();
-    let end = target
+    let end = end_date_inclusive
         .succ_opt()
-        .context("computing next day")?
+        .context("computing day after end")?
         .and_hms_opt(0, 0, 0)
         .unwrap()
         .and_local_timezone(Local)
@@ -71,6 +74,12 @@ pub fn scan(repo_path: &Path, date: Option<NaiveDate>) -> Result<Vec<CommitRecor
                 continue;
             }
             let commit = repo.find_commit(oid)?;
+            // Skip merge commits: they distort hour estimates and clutter the
+            // display; a merge's real work already appears in the branch it
+            // came from.
+            if commit.parent_count() > 1 {
+                continue;
+            }
             let time = commit.time().seconds();
             if time < start || time >= end {
                 continue;
