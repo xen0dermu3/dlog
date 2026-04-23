@@ -19,7 +19,7 @@ pub fn group_commits<'a>(records: &'a [CommitRecord]) -> Vec<Group<'a>> {
     let mut groups: BTreeMap<String, Vec<&'a CommitRecord>> = BTreeMap::new();
 
     for r in records {
-        let mut keys: Vec<String> = tickets::extract(&r.branch_at_head);
+        let mut keys: Vec<String> = tickets::extract(&r.branches);
         keys.extend(tickets::extract(&r.subject));
         keys.extend(tickets::extract(&r.body));
         keys.sort();

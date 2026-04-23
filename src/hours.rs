@@ -189,7 +189,7 @@ mod tests {
             author_time: ts,
             subject: "x".into(),
             body: String::new(),
-            branch_at_head: String::new(),
+            branches: String::new(),
             repo: "r".into(),
         }
     }

@@ -42,7 +42,8 @@ dlog
 Launches the terminal UI — three columns:
 
 - **Repos** (left) — the list of git repos to scan. Config persists to
-  `~/.dlog/config.toml`.
+  `~/.dlog/config.toml`; scan cache and pushed-worklog records persist to
+  `~/.dlog/dlog.sqlite`.
   `[a]` add (with fuzzy finder) · `[x]` remove · `[↑/↓]` select
 - **Date** (middle) — always-visible calendar.
   `[←/→/↑/↓]` move cursor · `[[ / ]]` change month · `[t]` today · `[y]` yesterday

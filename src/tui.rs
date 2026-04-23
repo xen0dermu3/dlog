@@ -23,9 +23,11 @@ use crate::hours::{format_hours, parse_duration};
 use crate::jira::{self, JiraClient, WorklogOutcome};
 use crate::report::{self, GroupSummary};
 use crate::scanner::{self, CommitRecord};
+use crate::store::Store;
 
 const FUZZY_LIMIT: usize = 8;
 const LEFT_PANE_WIDTH: u16 = 28;
+const LEFT_PANE_WIDTH_ADDING: u16 = 60;
 const MIDDLE_PANE_WIDTH: u16 = 30;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -114,11 +116,16 @@ struct App {
     push: Option<PushStage>,
     jira_client: Option<JiraClient>,
     pushed_this_session: HashSet<String>,
+
+    // Persistent store — None if the DB couldn't be opened (fall back to
+    // in-memory only).
+    store: Option<Store>,
 }
 
 impl App {
     fn new(config: Config) -> Self {
         let today = Local::now().date_naive();
+        let default_selection = today.pred_opt().unwrap_or(today);
         let mut repos_state = ListState::default();
         if !config.repos.is_empty() {
             repos_state.select(Some(0));
@@ -126,12 +133,17 @@ impl App {
         let focus = if config.repos.is_empty() {
             Focus::Left
         } else {
-            Focus::Middle
+            Focus::Right
         };
-        let cal_month = NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap();
+        let cal_month = NaiveDate::from_ymd_opt(
+            default_selection.year(),
+            default_selection.month(),
+            1,
+        )
+        .unwrap();
         Self {
             config,
-            selected_date: today,
+            selected_date: default_selection,
             range_anchor: None,
             today,
             cal_month,
@@ -154,6 +166,18 @@ impl App {
             push: None,
             jira_client: None,
             pushed_this_session: HashSet::new(),
+            store: Store::open().ok(),
+        }
+    }
+
+    /// Replace `pushed_this_session` with the set of tickets that already
+    /// have a worklog recorded in the on-disk store for the current range.
+    fn sync_pushed_from_store(&mut self) {
+        if let Some(store) = &self.store {
+            let (start, end) = self.current_range();
+            if let Ok(set) = store.worklogs_for_range(start, end) {
+                self.pushed_this_session = set;
+            }
         }
     }
 
@@ -473,9 +497,13 @@ fn handle_add_repo(app: &mut App, key: KeyEvent) {
                     }
                     app.repos_state
                         .select(Some(app.config.repos.len().saturating_sub(1)));
+                    // Stay in add-mode so the user can queue more repos.
+                    // Clear the query, refresh matches (the just-added repo
+                    // falls out of the list via the already-configured filter).
                     app.input.clear();
-                    app.fuzzy_matches.clear();
-                    app.left_mode = LeftMode::Browse;
+                    app.fuzzy_selected = 0;
+                    app.refresh_matches();
+                    app.left_mode = LeftMode::AddRepo { error: None };
                 }
                 Err(e) => {
                     app.left_mode = LeftMode::AddRepo { error: Some(e) };
@@ -566,18 +594,42 @@ fn do_scan(app: &mut App, force: bool) {
     }
     let (start, end) = app.current_range();
     let key = cache_key(start, end, &app.config.repos);
+
     if force {
         app.scan_cache.remove(&key);
+        if let Some(store) = &app.store {
+            let _ = store.clear_scan(start, end, &app.config.repos);
+        }
         app.hours_overrides.clear();
-    } else if let Some(cached) = app.scan_cache.get(&key) {
-        app.scan_records = cached.clone();
-        app.results_are_cached = true;
-        app.results_selected = 0;
-        app.results_edit = None;
-        app.results_scroll = 0;
-        app.focus = Focus::Right;
-        return;
+    } else {
+        // 1. In-memory cache hit.
+        if let Some(cached) = app.scan_cache.get(&key) {
+            app.scan_records = cached.clone();
+            app.results_are_cached = true;
+            app.results_selected = 0;
+            app.results_edit = None;
+            app.results_scroll = 0;
+            app.focus = Focus::Right;
+            app.sync_pushed_from_store();
+            return;
+        }
+        // 2. On-disk cache hit — warm the in-memory cache so subsequent
+        //    scans don't re-hit SQLite.
+        if let Some(store) = &app.store {
+            if let Ok(Some(records)) = store.load_scan(start, end, &app.config.repos) {
+                app.scan_cache.insert(key, records.clone());
+                app.scan_records = records;
+                app.results_are_cached = true;
+                app.results_selected = 0;
+                app.results_edit = None;
+                app.results_scroll = 0;
+                app.focus = Focus::Right;
+                app.sync_pushed_from_store();
+                return;
+            }
+        }
     }
+    // 3. No cache — trigger a fresh scan.
     app.scanning = true;
     app.focus = Focus::Right;
 }
@@ -830,39 +882,57 @@ fn handle_push_preview(app: &mut App, key: KeyEvent) {
 }
 
 fn step_push(app: &mut App) {
-    let Some(PushStage::Sending {
-        queue,
-        done,
-        failed,
-    }) = &mut app.push
-    else {
-        return;
+    // Scope the initial mutable borrow so we can touch other app fields below.
+    let item = {
+        let Some(PushStage::Sending {
+            queue,
+            done,
+            failed,
+        }) = &mut app.push
+        else {
+            return;
+        };
+        if queue.is_empty() {
+            let finished_done = std::mem::take(done);
+            let finished_failed = std::mem::take(failed);
+            app.push = Some(PushStage::Result {
+                done: finished_done,
+                failed: finished_failed,
+            });
+            return;
+        }
+        queue.remove(0)
     };
-    if queue.is_empty() {
-        let finished_done = std::mem::take(done);
-        let finished_failed = std::mem::take(failed);
-        app.push = Some(PushStage::Result {
-            done: finished_done,
-            failed: finished_failed,
-        });
-        return;
-    }
-    let item = queue.remove(0);
-    let Some(client) = &app.jira_client else {
-        app.error = Some("Jira client missing.".into());
-        app.push = None;
-        return;
+
+    let outcome = {
+        let Some(client) = &app.jira_client else {
+            app.error = Some("Jira client missing.".into());
+            app.push = None;
+            return;
+        };
+        client.post_worklog(&item.ticket, item.started, item.seconds)
     };
-    match client.post_worklog(&item.ticket, item.started, item.seconds) {
-        Ok(WorklogOutcome::Ok { .. }) => {
+
+    match outcome {
+        Ok(WorklogOutcome::Ok { worklog_id }) => {
             app.pushed_this_session.insert(item.ticket.clone());
-            done.push(item.ticket);
+            let (start, end) = app.current_range();
+            if let Some(store) = &app.store {
+                let _ = store.record_worklog(&item.ticket, start, end, &worklog_id);
+            }
+            if let Some(PushStage::Sending { done, .. }) = &mut app.push {
+                done.push(item.ticket);
+            }
         }
         Ok(WorklogOutcome::Err { status, message }) => {
-            failed.push((item.ticket, format!("HTTP {status}: {message}")));
+            if let Some(PushStage::Sending { failed, .. }) = &mut app.push {
+                failed.push((item.ticket, format!("HTTP {status}: {message}")));
+            }
         }
         Err(e) => {
-            failed.push((item.ticket, format!("{e:#}")));
+            if let Some(PushStage::Sending { failed, .. }) = &mut app.push {
+                failed.push((item.ticket, format!("{e:#}")));
+            }
         }
     }
 }
@@ -883,12 +953,16 @@ fn run_scan(app: &mut App) {
     all.sort_by_key(|r| r.author_time);
     let key = cache_key(start, end, &app.config.repos);
     app.scan_cache.insert(key, all.clone());
+    if let Some(store) = &app.store {
+        let _ = store.save_scan(start, end, &app.config.repos, &all);
+    }
     app.scan_records = all;
     app.results_are_cached = false;
     app.results_selected = 0;
     app.results_edit = None;
     app.results_scroll = 0;
     app.scanning = false;
+    app.sync_pushed_from_store();
 }
 
 // ---------- helpers -------------------------------------------------------
@@ -994,18 +1068,31 @@ fn render_layout(f: &mut Frame, area: Rect, app: &mut App) {
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(LEFT_PANE_WIDTH),
-            Constraint::Length(MIDDLE_PANE_WIDTH),
-            Constraint::Min(0),
-        ])
-        .split(outer[0]);
-
-    render_left_pane(f, panes[0], app);
-    render_middle_pane(f, panes[1], app);
-    render_right_pane(f, panes[2], app);
+    if app.is_adding() {
+        // Hide the calendar column while adding so the left pane can grow
+        // to show full paths, and the right pane keeps results in view.
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(LEFT_PANE_WIDTH_ADDING),
+                Constraint::Min(0),
+            ])
+            .split(outer[0]);
+        render_left_pane(f, panes[0], app);
+        render_right_pane(f, panes[1], app);
+    } else {
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(LEFT_PANE_WIDTH),
+                Constraint::Length(MIDDLE_PANE_WIDTH),
+                Constraint::Min(0),
+            ])
+            .split(outer[0]);
+        render_left_pane(f, panes[0], app);
+        render_middle_pane(f, panes[1], app);
+        render_right_pane(f, panes[2], app);
+    }
     render_hint_bar(f, outer[1], app);
 }
 
@@ -1306,15 +1393,16 @@ fn render_right_pane(f: &mut Frame, area: Rect, app: &mut App) {
     let groups = report::group_with_hours(&app.scan_records);
     let (lines, group_line_offsets) = lines_for_summaries(&groups, &app.scan_records, app);
 
-    // Auto-scroll to keep the selected group's header inside the view.
+    // Auto-scroll: if the selected group's header is outside the visible
+    // area, snap it to the top so its commit rows are visible below. If it's
+    // already in view, leave the scroll alone (don't jar on minor nav).
     let visible = inner.height;
     if let Some(&sel_line) = group_line_offsets.get(app.results_selected) {
         let top = app.results_scroll as usize;
         let sel = sel_line as usize;
-        if sel < top {
+        let in_view = sel >= top && sel < top + visible as usize;
+        if !in_view {
             app.results_scroll = sel_line;
-        } else if (sel + 1).saturating_sub(top) > visible as usize {
-            app.results_scroll = (sel_line + 1).saturating_sub(visible);
         }
     }
     // Clamp so we don't scroll past the bottom of the content.
@@ -1593,7 +1681,7 @@ fn render_hint_bar(f: &mut Frame, area: Rect, app: &App) {
             PushStage::Result { .. } => "press [Enter] or [Esc] to return",
         }
     } else if app.is_adding() {
-        "type to filter   [↑/↓] pick   [Enter] add   [Esc] cancel"
+        "type to filter   [↑/↓] pick   [Enter] add (keeps adding)   [Esc] done"
     } else if app.focus == Focus::Right && app.results_edit.is_some() {
         "type e.g. 30m, 2h, 2h 30m   [Enter] save   [Esc] cancel"
     } else {
