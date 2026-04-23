@@ -55,6 +55,7 @@ enum SetupStep {
     Url,
     Email,
     Token,
+    Statuses,
 }
 
 struct SetupState {
@@ -62,9 +63,35 @@ struct SetupState {
     url: String,
     email: String,
     token: String,
+    /// Comma-separated status names entered at the final setup step.
+    /// Parsed into `Vec<String>` before saving.
+    statuses: String,
     error: Option<String>,
-    /// True when invoked from `P` (edit existing settings) vs `p` first-run.
+    /// True when invoked from `J` (edit existing settings) vs `p` first-run.
     editing: bool,
+}
+
+struct FillItem {
+    ticket: String,
+    /// SessionSpan estimate — used as weight when no explicit marker.
+    session_hours: f32,
+    /// Sum of `[Xh]`/`[Nm]` markers from the ticket's commit messages.
+    /// `Some` → pinned: this ticket gets exactly this, budget splits the
+    /// rest. `None` → free-floating, gets a proportional share.
+    explicit_hours: Option<f32>,
+}
+
+enum FillStage {
+    Input {
+        buffer: String,
+        error: Option<String>,
+    },
+    Preview {
+        budget_hours: f32,
+        items: Vec<FillItem>,
+        checks: Vec<bool>,
+        cursor: usize,
+    },
 }
 
 enum PushStage {
@@ -131,6 +158,9 @@ struct App {
     // and (manually) on `G` refresh. Empty when no GitHub repos are
     // configured or `gh` is unavailable.
     pr_index: HashMap<String, Vec<PrInfo>>,
+
+    // Budget-split flow (`f` key). Right-pane takeover while Some.
+    fill: Option<FillStage>,
 }
 
 impl App {
@@ -181,6 +211,7 @@ impl App {
             standup: None,
             standup_scroll: 0,
             pr_index: HashMap::new(),
+            fill: None,
         }
     }
 
@@ -320,6 +351,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         handle_push(app, key);
         return Ok(false);
     }
+    if app.fill.is_some() {
+        handle_fill(app, key);
+        return Ok(false);
+    }
     if app.standup.is_some() {
         handle_standup(app, key);
         return Ok(false);
@@ -372,6 +407,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         }
         KeyCode::Char('G') => {
             refresh_github_prs(app);
+            return Ok(false);
+        }
+        KeyCode::Char('f') => {
+            open_fill(app);
             return Ok(false);
         }
         _ => {}
@@ -471,13 +510,13 @@ fn handle_middle(app: &mut App, key: KeyEvent) {
 fn handle_right(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Down | KeyCode::Char('j') => {
-            let n = report::group_with_hours(&app.scan_records).len();
+            let n = report::group_with_hours_cfg(&app.scan_records, &app.config.estimation).len();
             if n > 0 {
                 app.results_selected = (app.results_selected + 1) % n;
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            let n = report::group_with_hours(&app.scan_records).len();
+            let n = report::group_with_hours_cfg(&app.scan_records, &app.config.estimation).len();
             if n > 0 {
                 app.results_selected = (app.results_selected + n - 1) % n;
             }
@@ -571,7 +610,7 @@ fn handle_edit_hours(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             if let Some(v) = parse_duration(buf) {
-                let groups = report::group_with_hours(&app.scan_records);
+                let groups = report::group_with_hours_cfg(&app.scan_records, &app.config.estimation);
                 if let Some(g) = groups.get(app.results_selected) {
                     app.hours_overrides.insert(g.ticket.clone(), v);
                 }
@@ -662,6 +701,194 @@ fn do_scan(app: &mut App, force: bool) {
 
 // ---------- push flow -----------------------------------------------------
 
+// ---------- budget-split "fill" flow -------------------------------------
+
+fn open_fill(app: &mut App) {
+    if app.scan_records.is_empty() {
+        app.error = Some("Nothing to fill — run a scan first.".into());
+        return;
+    }
+    let default = app.config.estimation.budget_default_hours;
+    // Preload the input with the configured default formatted nicely.
+    let buffer = format_hours(default).replace(' ', "");
+    app.fill = Some(FillStage::Input {
+        buffer,
+        error: None,
+    });
+    app.focus = Focus::Right;
+}
+
+fn handle_fill(app: &mut App, key: KeyEvent) {
+    match &mut app.fill {
+        Some(FillStage::Input { buffer, error }) => match key.code {
+            KeyCode::Esc => {
+                app.fill = None;
+            }
+            KeyCode::Enter => {
+                if let Some(v) = parse_duration(buffer) {
+                    if v <= 0.0 {
+                        *error = Some("budget must be > 0".into());
+                        return;
+                    }
+                    // Build preview items. Session weight + any explicit
+                    // marker already live on GroupSummary.
+                    let groups = crate::report::group_with_hours_cfg(
+                        &app.scan_records,
+                        &app.config.estimation,
+                    );
+                    let items: Vec<FillItem> = groups
+                        .iter()
+                        .map(|g| FillItem {
+                            ticket: g.ticket.clone(),
+                            session_hours: g.session_weight,
+                            explicit_hours: g.explicit,
+                        })
+                        .collect();
+                    if items.is_empty() {
+                        app.fill = None;
+                        return;
+                    }
+                    let checks = vec![true; items.len()];
+                    app.fill = Some(FillStage::Preview {
+                        budget_hours: v,
+                        items,
+                        checks,
+                        cursor: 0,
+                    });
+                } else {
+                    *error = Some("type something like 8h, 7h 30m, or 6.5".into());
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                *error = None;
+            }
+            KeyCode::Char(c)
+                if c.is_ascii_digit() || matches!(c, '.' | 'h' | 'H' | 'm' | 'M' | ' ') =>
+            {
+                buffer.push(c);
+                *error = None;
+            }
+            _ => {}
+        },
+        Some(FillStage::Preview {
+            items,
+            checks,
+            cursor,
+            budget_hours,
+        }) => match key.code {
+            KeyCode::Esc => {
+                app.fill = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if !items.is_empty() {
+                    *cursor = (*cursor + items.len() - 1) % items.len();
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !items.is_empty() {
+                    *cursor = (*cursor + 1) % items.len();
+                }
+            }
+            KeyCode::Char(' ') => {
+                if let Some(c) = checks.get_mut(*cursor) {
+                    *c = !*c;
+                }
+            }
+            KeyCode::Enter => {
+                let alloc = allocate_fill_budget(
+                    items,
+                    checks,
+                    *budget_hours,
+                    &app.config.estimation,
+                );
+                for (i, hours) in alloc.iter().enumerate() {
+                    if checks[i] && *hours > 0.0 {
+                        app.hours_overrides
+                            .insert(items[i].ticket.clone(), *hours);
+                    }
+                }
+                app.fill = None;
+            }
+            _ => {}
+        },
+        None => {}
+    }
+}
+
+/// Distribute `budget_hours` across checked items in two phases:
+///   1. Tickets with an `explicit_hours` marker are **pinned** to that
+///      exact value — user-authored `[2h]` in commits wins.
+///   2. The remaining budget is split among the *other* checked tickets
+///      proportional to their `session_hours` weight (floored at
+///      `lead+trail` so single-commit tickets don't vanish).
+/// Unchecked items get 0. Minute-level rounding; residual goes to the
+/// largest non-pinned weighted item so totals match the budget exactly.
+fn allocate_fill_budget(
+    items: &[FillItem],
+    checks: &[bool],
+    budget_hours: f32,
+    cfg: &crate::config::EstimationConfig,
+) -> Vec<f32> {
+    let floor_h = (cfg.lead_min + cfg.trail_min) as f32 / 60.0;
+    let budget_min = (budget_hours * 60.0).round() as i64;
+    let mut mins: Vec<i64> = vec![0; items.len()];
+
+    // Phase 1: pin explicit.
+    let mut pinned: i64 = 0;
+    for (i, it) in items.iter().enumerate() {
+        if !checks[i] {
+            continue;
+        }
+        if let Some(h) = it.explicit_hours {
+            let m = (h * 60.0).round() as i64;
+            mins[i] = m;
+            pinned += m;
+        }
+    }
+
+    // Phase 2: split remainder among free (checked + no explicit) items.
+    let remaining = (budget_min - pinned).max(0);
+    let weights: Vec<f32> = items
+        .iter()
+        .enumerate()
+        .map(|(i, it)| {
+            if !checks[i] || it.explicit_hours.is_some() {
+                return 0.0;
+            }
+            if it.session_hours > 0.0 {
+                it.session_hours
+            } else {
+                floor_h
+            }
+        })
+        .collect();
+    let total: f32 = weights.iter().sum();
+    if remaining > 0 && total > 0.0 {
+        for (i, w) in weights.iter().enumerate() {
+            if *w > 0.0 {
+                mins[i] = (remaining as f32 * (w / total)).round() as i64;
+            }
+        }
+    }
+
+    // Phase 3: rounding residual → largest non-pinned weighted item.
+    let sum: i64 = mins.iter().sum();
+    let delta = budget_min - sum;
+    if delta != 0 {
+        if let Some((idx, _)) = weights
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w > 0.0)
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            mins[idx] = (mins[idx] + delta).max(0);
+        }
+    }
+
+    mins.into_iter().map(|m| m as f32 / 60.0).collect()
+}
+
 fn build_pr_index(repos: &[PathBuf]) -> HashMap<String, Vec<PrInfo>> {
     let mut idx: HashMap<String, Vec<PrInfo>> = HashMap::new();
     for path in repos {
@@ -708,7 +935,22 @@ fn refresh_github_prs(app: &mut App) {
 }
 
 fn open_standup(app: &mut App) {
-    match standup::build(&app.config, app.today) {
+    // Lazily construct the Jira client if configured so the standup can
+    // also fetch today's in-progress tickets.
+    if app.jira_client.is_none() {
+        if let Some(cfg) = &app.config.jira {
+            app.jira_client = JiraClient::from_config(cfg).ok();
+        }
+    }
+    // Refresh the PR index so "Today — plan" sees the latest open PRs
+    // even when the user opens standup without having scanned today.
+    refresh_github_prs(app);
+    match standup::build(
+        &app.config,
+        app.today,
+        &app.pr_index,
+        app.jira_client.as_ref(),
+    ) {
         Ok(report) => {
             app.standup = Some(report);
             app.standup_scroll = 0;
@@ -737,15 +979,20 @@ fn handle_standup(app: &mut App, key: KeyEvent) {
 }
 
 fn open_jira_settings(app: &mut App) {
-    let (url, email) = match &app.config.jira {
-        Some(c) => (c.base_url.clone(), c.email.clone()),
-        None => (String::new(), String::new()),
+    let (url, email, statuses) = match &app.config.jira {
+        Some(c) => (
+            c.base_url.clone(),
+            c.email.clone(),
+            c.status_filter.join(", "),
+        ),
+        None => (String::new(), String::new(), "In Progress".to_string()),
     };
     app.push = Some(PushStage::Setup(SetupState {
         step: SetupStep::Url,
         url,
         email,
         token: String::new(),
+        statuses,
         error: None,
         editing: true,
     }));
@@ -763,6 +1010,7 @@ fn start_push(app: &mut App) {
                 url: String::new(),
                 email: String::new(),
                 token: String::new(),
+                statuses: "In Progress".to_string(),
                 error: None,
                 editing: false,
             }));
@@ -802,7 +1050,7 @@ fn open_preview(app: &mut App) {
 }
 
 fn build_push_items(app: &App) -> Vec<PushItem> {
-    let groups = report::group_with_hours(&app.scan_records);
+    let groups = report::group_with_hours_cfg(&app.scan_records, &app.config.estimation);
     groups
         .into_iter()
         .filter(|g| g.ticket != report::UNTAGGED)
@@ -884,9 +1132,26 @@ fn handle_push_setup(app: &mut App, key: KeyEvent) {
                         state.error = Some(format!("keyring: {e:#}"));
                         return;
                     }
+                    // Advance to the statuses step.
+                    state.step = SetupStep::Statuses;
+                    state.error = None;
+                }
+                SetupStep::Statuses => {
+                    let parsed: Vec<String> = state
+                        .statuses
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let statuses = if parsed.is_empty() {
+                        vec!["In Progress".to_string()]
+                    } else {
+                        parsed
+                    };
                     let cfg = JiraConfig {
                         base_url: state.url.clone(),
                         email: state.email.clone(),
+                        status_filter: statuses,
                     };
                     let editing = state.editing;
                     app.config.jira = Some(cfg.clone());
@@ -922,11 +1187,15 @@ fn handle_push_setup(app: &mut App, key: KeyEvent) {
             SetupStep::Token => {
                 state.token.pop();
             }
+            SetupStep::Statuses => {
+                state.statuses.pop();
+            }
         },
         KeyCode::Char(c) => match state.step {
             SetupStep::Url => state.url.push(c),
             SetupStep::Email => state.email.push(c),
             SetupStep::Token => state.token.push(c),
+            SetupStep::Statuses => state.statuses.push(c),
         },
         _ => {}
     }
@@ -1437,6 +1706,12 @@ fn render_middle_pane(f: &mut Frame, area: Rect, app: &App) {
 fn render_right_pane(f: &mut Frame, area: Rect, app: &mut App) {
     let title = if app.standup.is_some() {
         " standup "
+    } else if app.fill.is_some() {
+        match &app.fill {
+            Some(FillStage::Input { .. }) => " fill — budget ",
+            Some(FillStage::Preview { .. }) => " fill — preview ",
+            None => " fill ",
+        }
     } else {
         match &app.push {
             Some(PushStage::Setup(s)) if s.editing => " Jira settings ",
@@ -1449,6 +1724,8 @@ fn render_right_pane(f: &mut Frame, area: Rect, app: &mut App) {
     };
     let border_color = if app.standup.is_some() {
         Color::Blue
+    } else if app.fill.is_some() {
+        Color::LightGreen
     } else if app.push.is_some() {
         Color::Magenta
     } else if app.focus == Focus::Right {
@@ -1470,6 +1747,11 @@ fn render_right_pane(f: &mut Frame, area: Rect, app: &mut App) {
 
     if let Some(report) = &app.standup {
         render_standup(f, inner, report, app.standup_scroll);
+        return;
+    }
+
+    if let Some(stage) = &app.fill {
+        render_fill(f, inner, stage, &app.config.estimation);
         return;
     }
 
@@ -1509,7 +1791,7 @@ fn render_right_pane(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let groups = report::group_with_hours(&app.scan_records);
+    let groups = report::group_with_hours_cfg(&app.scan_records, &app.config.estimation);
     let (lines, group_line_offsets) = lines_for_summaries(&groups, &app.scan_records, app);
 
     // Auto-scroll: if the selected group's header is outside the visible
@@ -1553,9 +1835,10 @@ fn render_push(f: &mut Frame, area: Rect, stage: &PushStage) {
 
 fn render_push_setup(f: &mut Frame, area: Rect, state: &SetupState) {
     let (step_label, current) = match state.step {
-        SetupStep::Url => ("step 1/3: base URL", &state.url),
-        SetupStep::Email => ("step 2/3: email", &state.email),
-        SetupStep::Token => ("step 3/3: API token", &state.token),
+        SetupStep::Url => ("step 1/4: base URL", &state.url),
+        SetupStep::Email => ("step 2/4: email", &state.email),
+        SetupStep::Token => ("step 3/4: API token", &state.token),
+        SetupStep::Statuses => ("step 4/4: today-plan statuses", &state.statuses),
     };
     let display: String = match state.step {
         SetupStep::Token => "*".repeat(current.chars().count()),
@@ -1592,6 +1875,9 @@ fn render_push_setup(f: &mut Frame, area: Rect, state: &SetupState) {
             } else {
                 "  create at id.atlassian.com → Security → API tokens.  saved to Keychain."
             }
+        }
+        SetupStep::Statuses => {
+            "  comma-separated statuses that mean \"I'll work on this today\", e.g. In Progress, In Review"
         }
     };
     lines.push(Line::from(Span::styled(
@@ -1813,6 +2099,37 @@ fn render_standup(f: &mut Frame, area: Rect, report: &StandupReport, scroll: u16
         }
     }
 
+    // --- Today — plan (Jira + open PRs) ---
+    if !report.today_plan.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Today — plan",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        for item in &report.today_plan {
+            let key = item.ticket.as_deref().unwrap_or("—");
+            let mut tags: Vec<String> = Vec::new();
+            if let Some(s) = &item.status {
+                tags.push(s.clone());
+            }
+            if let Some(n) = item.pr_number {
+                tags.push(format!("PR #{n} open"));
+            }
+            let tag_str = if tags.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", tags.join(", "))
+            };
+            lines.push(Line::from(format!(
+                "  • {key}{tag_str}: {}",
+                item.title
+            )));
+        }
+    }
+
     let para = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
@@ -1867,6 +2184,113 @@ fn summarise_commits(commits: &[&CommitRecord], ticket: &str) -> String {
     }
 }
 
+fn render_fill(
+    f: &mut Frame,
+    area: Rect,
+    stage: &FillStage,
+    cfg: &crate::config::EstimationConfig,
+) {
+    match stage {
+        FillStage::Input { buffer, error } => {
+            let mut lines: Vec<Line> = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Set a day budget — hours will be split across tickets",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(format!("  budget: {buffer}_")),
+                Line::from(""),
+            ];
+            if let Some(err) = error {
+                lines.push(Line::from(Span::styled(
+                    format!("  {err}"),
+                    Style::default().fg(Color::Red),
+                )));
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                "  examples: 8h, 7h 30m, 6.5",
+                Style::default().fg(Color::DarkGray),
+            )));
+            f.render_widget(Paragraph::new(Text::from(lines)), area);
+        }
+        FillStage::Preview {
+            items,
+            checks,
+            cursor,
+            budget_hours,
+        } => {
+            let alloc = allocate_fill_budget(items, checks, *budget_hours, cfg);
+            let mut lines: Vec<Line> = vec![Line::from("")];
+
+            // Column widths for a tidy column alignment.
+            let ticket_w = items.iter().map(|i| i.ticket.len()).max().unwrap_or(0);
+
+            let mut selected_total: f32 = 0.0;
+            let mut selected_count = 0;
+
+            for (i, it) in items.iter().enumerate() {
+                let checked = checks[i];
+                let marker = if i == *cursor { "> " } else { "  " };
+                let box_mark = if checked { "[x]" } else { "[ ]" };
+                // If the ticket has explicit markers, show them as "pinned"
+                // — the fill algorithm locks this value exactly and splits
+                // the rest of the budget among free tickets.
+                let weight_label = match it.explicit_hours {
+                    Some(h) => format!("pinned {:>8}", format_hours(h)),
+                    None => format!("session {:>8}", format_hours(it.session_hours)),
+                };
+                let allocated = alloc[i];
+                let alloc_str = if checked {
+                    format_hours(allocated)
+                } else {
+                    "—".to_string()
+                };
+                let text = format!(
+                    "{marker}{box_mark}  {:<tw$}   {}   →   {}",
+                    it.ticket,
+                    weight_label,
+                    alloc_str,
+                    tw = ticket_w
+                );
+                let style = if i == *cursor {
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else if !checked {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(text, style)));
+                if checked {
+                    selected_total += allocated;
+                    selected_count += 1;
+                }
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {} of {} ticket{} — total {} (budget {})",
+                    selected_count,
+                    items.len(),
+                    if items.len() == 1 { "" } else { "s" },
+                    format_hours(selected_total),
+                    format_hours(*budget_hours),
+                ),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+
+            f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
+        }
+    }
+}
+
 fn render_scanning_skeleton(f: &mut Frame, area: Rect, app: &App) {
     let n = app.config.repos.len();
     let (s, e) = app.current_range();
@@ -1904,6 +2328,13 @@ fn render_hint_bar(f: &mut Frame, area: Rect, app: &App) {
         "scanning..."
     } else if app.standup.is_some() {
         "[PgUp/PgDn] scroll   [Esc] close"
+    } else if let Some(stage) = &app.fill {
+        match stage {
+            FillStage::Input { .. } => "type budget (e.g. 8h)   [Enter] next   [Esc] cancel",
+            FillStage::Preview { .. } => {
+                "[↑↓] select   [space] toggle   [Enter] apply   [Esc] cancel"
+            }
+        }
     } else if let Some(stage) = &app.push {
         match stage {
             PushStage::Setup(_) => "type to enter   [Enter] next   [Esc] cancel",
@@ -1926,7 +2357,7 @@ fn render_hint_bar(f: &mut Frame, area: Rect, app: &App) {
                 "[Tab] switch   [←→↑↓] move   [[/]] month   [t] today   [y] yesterday   [space] range   [m] standup   [s] scan"
             }
             Focus::Right => {
-                "[Tab] switch   [↑↓] group   [e] time   [m] standup   [s] scan   [S] rescan   [p] push   [G] refresh PRs   [J] Jira"
+                "[Tab] switch   [↑↓] group   [e] time   [f] fill budget   [m] standup   [s] scan   [S] rescan   [p] push   [G] PRs   [J] Jira"
             }
         }
     };
@@ -1986,6 +2417,15 @@ fn lines_for_summaries(
                     format_hours(*ov)
                 ),
                 *ov,
+            )
+        } else if g.explicit.is_some() {
+            (
+                format!(
+                    "{marker}{}{pushed_badge} — {} (from commits)",
+                    g.ticket,
+                    g.gap.display()
+                ),
+                g.gap.value,
             )
         } else {
             (

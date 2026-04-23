@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, FixedOffset};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::JiraConfig;
 
@@ -10,6 +10,13 @@ pub struct JiraClient {
     base_url: String,
     email: String,
     token: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct IssueInfo {
+    pub key: String,
+    pub summary: String,
+    pub status: String,
 }
 
 #[derive(Debug)]
@@ -107,6 +114,79 @@ impl JiraClient {
             let message = extract_error_message(&text).unwrap_or(text);
             Ok(WorklogOutcome::Err { status, message })
         }
+    }
+
+    /// Search Jira issues assigned to the current user whose status is in
+    /// `statuses`. Empty statuses → empty result. Returns up to 50 issues
+    /// ordered by most-recently-updated.
+    pub fn search_issues(&self, statuses: &[String]) -> Result<Vec<IssueInfo>> {
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let quoted: Vec<String> = statuses.iter().map(|s| format!("\"{s}\"")).collect();
+        let jql = format!(
+            "assignee = currentUser() AND status in ({}) ORDER BY updated DESC",
+            quoted.join(",")
+        );
+        let url = format!("{}/rest/api/3/search/jql", self.base_url);
+        let body = serde_json::json!({
+            "jql": jql,
+            "fields": ["summary", "status"],
+            "maxResults": 50,
+        });
+
+        let mut response = ureq::post(&url)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .header("Authorization", &format!("Basic {}", self.basic_auth()))
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .send_json(&body)
+            .context("Jira search request")?;
+
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            let text = response
+                .body_mut()
+                .read_to_string()
+                .unwrap_or_else(|_| "<no body>".to_string());
+            let message = extract_error_message(&text).unwrap_or(text);
+            bail!("Jira search HTTP {status}: {message}");
+        }
+
+        #[derive(Deserialize)]
+        struct SearchResp {
+            issues: Vec<IssueRaw>,
+        }
+        #[derive(Deserialize)]
+        struct IssueRaw {
+            key: String,
+            fields: FieldsRaw,
+        }
+        #[derive(Deserialize)]
+        struct FieldsRaw {
+            summary: String,
+            status: StatusRaw,
+        }
+        #[derive(Deserialize)]
+        struct StatusRaw {
+            name: String,
+        }
+
+        let parsed: SearchResp = response
+            .body_mut()
+            .read_json()
+            .context("parsing Jira search JSON")?;
+        Ok(parsed
+            .issues
+            .into_iter()
+            .map(|i| IssueInfo {
+                key: i.key,
+                summary: i.fields.summary,
+                status: i.fields.status.name,
+            })
+            .collect())
     }
 
     fn basic_auth(&self) -> String {

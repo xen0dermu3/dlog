@@ -1,3 +1,4 @@
+use crate::config::EstimationConfig;
 use crate::scanner::CommitRecord;
 
 #[derive(Clone, Debug)]
@@ -94,63 +95,79 @@ pub trait HoursEstimator {
     fn estimate(&self, commits: &[&CommitRecord]) -> Hours;
 }
 
-pub struct CommitGap {
-    pub idle_gap_min: u32,
+/// Session-based estimator: break a ticket's commits into **work sessions**
+/// separated by gaps longer than `session_break_min`. Each session's
+/// contribution is `(last - first) + lead + trail`. Single-commit sessions
+/// contribute `lead + trail`.
+///
+/// Replaces the old per-gap-clamp heuristic, which under-counted time for
+/// users who commit sparsely (every 1–2 hours) while actually working
+/// continuously in between.
+pub struct SessionSpan {
+    pub session_break_min: u32,
     pub lead_min: u32,
     pub trail_min: u32,
 }
 
-impl Default for CommitGap {
+impl Default for SessionSpan {
     fn default() -> Self {
         Self {
-            idle_gap_min: 30,
+            session_break_min: 120,
             lead_min: 15,
             trail_min: 15,
         }
     }
 }
 
-impl HoursEstimator for CommitGap {
+impl SessionSpan {
+    pub fn from_config(cfg: &EstimationConfig) -> Self {
+        Self {
+            session_break_min: cfg.session_break_min,
+            lead_min: cfg.lead_min,
+            trail_min: cfg.trail_min,
+        }
+    }
+}
+
+impl HoursEstimator for SessionSpan {
     fn name(&self) -> &'static str {
-        "gap"
+        "session"
     }
 
     fn estimate(&self, commits: &[&CommitRecord]) -> Hours {
         if commits.is_empty() {
             return Hours::zero("no commits");
         }
-        if commits.len() == 1 {
-            let mins = self.lead_min + self.trail_min;
-            return Hours {
-                value: mins as f32 / 60.0,
-                detail: format!("single commit ({} min default)", mins),
-            };
-        }
         let mut times: Vec<i64> = commits.iter().map(|c| c.author_time).collect();
         times.sort_unstable();
-        let idle_seconds = (self.idle_gap_min as i64) * 60;
-        let mut total: i64 = 0;
-        let mut clamps: usize = 0;
-        for w in times.windows(2) {
-            let gap = w[1] - w[0];
-            if gap <= idle_seconds {
-                total += gap;
-            } else {
-                total += idle_seconds;
-                clamps += 1;
+
+        let break_secs = (self.session_break_min as i64) * 60;
+        let buffer_secs = (self.lead_min as i64 + self.trail_min as i64) * 60;
+
+        // Split times into sessions.
+        let mut sessions: Vec<(i64, i64)> = Vec::new();
+        let mut session_start = times[0];
+        let mut session_end = times[0];
+        for &t in &times[1..] {
+            if t - session_end > break_secs {
+                sessions.push((session_start, session_end));
+                session_start = t;
             }
+            session_end = t;
         }
-        total += (self.lead_min as i64) * 60;
-        total += (self.trail_min as i64) * 60;
-        let value = total as f32 / 3600.0;
+        sessions.push((session_start, session_end));
+
+        let n_sessions = sessions.len();
+        let total_secs: i64 = sessions
+            .iter()
+            .map(|(s, e)| (e - s) + buffer_secs)
+            .sum();
+        let value = total_secs as f32 / 3600.0;
         let n = commits.len();
-        let detail = if clamps == 0 {
-            format!("{n} commits")
+        let detail = if n_sessions == 1 {
+            format!("{n} commits, 1 session")
         } else {
-            format!(
-                "{n} commits, {clamps} gap{} clamped",
-                if clamps == 1 { "" } else { "s" }
-            )
+            format!("{n} commits, {n_sessions} sessions")
         };
         Hours { value, detail }
     }
@@ -241,36 +258,69 @@ mod tests {
     }
 
     #[test]
-    fn gap_single_commit_returns_lead_plus_trail() {
+    fn session_single_commit_returns_lead_plus_trail() {
         let commits = vec![c(0)];
         let refs: Vec<&CommitRecord> = commits.iter().collect();
-        let h = CommitGap::default().estimate(&refs);
+        let h = SessionSpan::default().estimate(&refs);
         assert!(approx(h.value, 0.5), "expected 0.5h, got {}", h.value);
     }
 
     #[test]
-    fn gap_three_close_commits_sums_gaps_plus_buffers() {
-        // 10-minute gaps → 20 minutes inside + 15+15 buffer = 50 minutes.
+    fn session_three_close_commits_one_session() {
+        // 10-minute gaps → one session spanning 20 minutes + 15+15 buffer.
         let commits = vec![c(0), c(600), c(1200)];
         let refs: Vec<&CommitRecord> = commits.iter().collect();
-        let h = CommitGap::default().estimate(&refs);
+        let h = SessionSpan::default().estimate(&refs);
         let expected = (20.0 + 30.0) / 60.0;
         assert!(approx(h.value, expected), "expected {expected}h, got {}", h.value);
-        assert_eq!(h.detail, "3 commits");
+        assert_eq!(h.detail, "3 commits, 1 session");
     }
 
     #[test]
-    fn gap_clamps_idle_periods() {
-        // Two commits 2 hours apart → clamped to 30 min + 30 min buffer = 60 min.
-        let commits = vec![c(0), c(7200)];
+    fn session_two_splits_past_threshold() {
+        // 121-minute gap (just past default 120 threshold) → two sessions.
+        let commits = vec![c(0), c(121 * 60)];
         let refs: Vec<&CommitRecord> = commits.iter().collect();
-        let h = CommitGap::default().estimate(&refs);
-        assert!(approx(h.value, 1.0), "expected 1.0h, got {}", h.value);
-        assert!(
-            h.detail.contains("clamped"),
-            "detail should mention clamp: {}",
-            h.detail
-        );
+        let h = SessionSpan::default().estimate(&refs);
+        // Each single-commit session gets 30 min (lead + trail).
+        let expected = 1.0;
+        assert!(approx(h.value, expected), "expected {expected}h, got {}", h.value);
+        assert_eq!(h.detail, "2 commits, 2 sessions");
+    }
+
+    #[test]
+    fn session_stays_together_below_threshold() {
+        // 60-minute gap (under 120) → one session of 60 min + buffer.
+        let commits = vec![c(0), c(60 * 60)];
+        let refs: Vec<&CommitRecord> = commits.iter().collect();
+        let h = SessionSpan::default().estimate(&refs);
+        let expected = 1.5; // 60m + 15 + 15 = 90m
+        assert!(approx(h.value, expected), "expected {expected}h, got {}", h.value);
+    }
+
+    #[test]
+    fn session_real_apr_23_timeline() {
+        // Regression guard: 9 commits spanning 10:01–17:27, 120-min break.
+        // From the user's real scan. Should yield ~6h 22m.
+        // Times below are seconds since 10:01 (origin) per commit.
+        let commits = vec![
+            c(0),              // 10:01
+            c(2 * 60),         // 10:03
+            c((2 * 60 + 6) * 60),  // 12:07  (gap 124m → new session)
+            c((3 * 60 + 42) * 60), // 13:43
+            c((4 * 60 + 12) * 60), // 14:13
+            c((4 * 60 + 24) * 60), // 14:25
+            c((6 * 60 + 19) * 60), // 16:20  (gap 115m, still same session)
+            c((7 * 60 + 21) * 60), // 17:22
+            c((7 * 60 + 26) * 60), // 17:27
+        ];
+        let refs: Vec<&CommitRecord> = commits.iter().collect();
+        let h = SessionSpan::default().estimate(&refs);
+        // Session 1 (10:01–10:03) = 2m + 30m buffer = 32m
+        // Session 2 (12:07–17:27) = 320m + 30m buffer = 350m
+        // Total = 382m ≈ 6.366h
+        assert!(h.value > 6.3 && h.value < 6.5, "got {}", h.value);
+        assert_eq!(h.detail, "9 commits, 2 sessions");
     }
 
     #[test]

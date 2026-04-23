@@ -11,12 +11,58 @@ pub struct Config {
     pub repos: Vec<PathBuf>,
     #[serde(default)]
     pub jira: Option<JiraConfig>,
+    #[serde(default)]
+    pub estimation: EstimationConfig,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct JiraConfig {
     pub base_url: String,
     pub email: String,
+    /// Statuses to consider as "today's plan" in the standup view.
+    /// Defaults to `["In Progress"]`.
+    #[serde(default = "default_status_filter")]
+    pub status_filter: Vec<String>,
+}
+
+fn default_status_filter() -> Vec<String> {
+    vec!["In Progress".to_string()]
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct EstimationConfig {
+    #[serde(default = "default_session_break_min")]
+    pub session_break_min: u32,
+    #[serde(default = "default_lead_min")]
+    pub lead_min: u32,
+    #[serde(default = "default_trail_min")]
+    pub trail_min: u32,
+    #[serde(default = "default_budget_hours")]
+    pub budget_default_hours: f32,
+}
+
+impl Default for EstimationConfig {
+    fn default() -> Self {
+        Self {
+            session_break_min: default_session_break_min(),
+            lead_min: default_lead_min(),
+            trail_min: default_trail_min(),
+            budget_default_hours: default_budget_hours(),
+        }
+    }
+}
+
+fn default_session_break_min() -> u32 {
+    120
+}
+fn default_lead_min() -> u32 {
+    15
+}
+fn default_trail_min() -> u32 {
+    15
+}
+fn default_budget_hours() -> f32 {
+    8.0
 }
 
 impl Config {
