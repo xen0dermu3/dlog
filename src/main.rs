@@ -1,5 +1,6 @@
 mod config;
 mod fuzzy;
+mod github;
 mod hours;
 mod jira;
 mod report;

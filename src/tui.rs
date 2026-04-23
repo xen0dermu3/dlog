@@ -19,6 +19,7 @@ use ratatui::{Frame, Terminal};
 
 use crate::config::{Config, JiraConfig};
 use crate::fuzzy::{self, FuzzyIndex};
+use crate::github::{self, PrInfo};
 use crate::hours::{format_hours, parse_duration};
 use crate::jira::{self, JiraClient, WorklogOutcome};
 use crate::report::{self, GroupSummary};
@@ -125,6 +126,11 @@ struct App {
     // Morning standup overlay — when Some, right pane renders the report.
     standup: Option<StandupReport>,
     standup_scroll: u16,
+
+    // GitHub PR enrichment: OID → PRs that contain it. Populated on scan
+    // and (manually) on `G` refresh. Empty when no GitHub repos are
+    // configured or `gh` is unavailable.
+    pr_index: HashMap<String, Vec<PrInfo>>,
 }
 
 impl App {
@@ -174,6 +180,7 @@ impl App {
             store: Store::open().ok(),
             standup: None,
             standup_scroll: 0,
+            pr_index: HashMap::new(),
         }
     }
 
@@ -361,6 +368,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         }
         KeyCode::Char('m') => {
             open_standup(app);
+            return Ok(false);
+        }
+        KeyCode::Char('G') => {
+            refresh_github_prs(app);
             return Ok(false);
         }
         _ => {}
@@ -650,6 +661,51 @@ fn do_scan(app: &mut App, force: bool) {
 }
 
 // ---------- push flow -----------------------------------------------------
+
+fn build_pr_index(repos: &[PathBuf]) -> HashMap<String, Vec<PrInfo>> {
+    let mut idx: HashMap<String, Vec<PrInfo>> = HashMap::new();
+    for path in repos {
+        if github::is_github_repo(path) {
+            for pr in github::fetch_prs(path) {
+                for oid in &pr.commit_oids {
+                    idx.entry(oid.clone()).or_default().push(pr.clone());
+                }
+            }
+        }
+    }
+    idx
+}
+
+fn enrich_records_with_prs(
+    records: &mut Vec<CommitRecord>,
+    pr_index: &HashMap<String, Vec<PrInfo>>,
+) {
+    for r in records.iter_mut() {
+        let Some(prs) = pr_index.get(&r.oid) else {
+            continue;
+        };
+        let extra: String = prs
+            .iter()
+            .flat_map(|pr| [pr.title.as_str(), pr.body.as_str(), pr.head_branch.as_str()])
+            .collect::<Vec<_>>()
+            .join(" ");
+        if extra.is_empty() {
+            continue;
+        }
+        if r.branches.is_empty() {
+            r.branches = extra;
+        } else {
+            r.branches.push(' ');
+            r.branches.push_str(&extra);
+        }
+    }
+}
+
+fn refresh_github_prs(app: &mut App) {
+    let idx = build_pr_index(&app.config.repos);
+    enrich_records_with_prs(&mut app.scan_records, &idx);
+    app.pr_index = idx;
+}
 
 fn open_standup(app: &mut App) {
     match standup::build(&app.config, app.today) {
@@ -995,12 +1051,20 @@ fn run_scan(app: &mut App) {
         }
     }
     all.sort_by_key(|r| r.author_time);
+
+    // Pull GitHub PR metadata for all configured github repos, then enrich
+    // each commit's `branches` string with PR title/body/head-branch text so
+    // ticket extraction catches keys that only appear in the PR.
+    let pr_index = build_pr_index(&app.config.repos);
+    enrich_records_with_prs(&mut all, &pr_index);
+
     let key = cache_key(start, end, &app.config.repos);
     app.scan_cache.insert(key, all.clone());
     if let Some(store) = &app.store {
         let _ = store.save_scan(start, end, &app.config.repos, &all);
     }
     app.scan_records = all;
+    app.pr_index = pr_index;
     app.results_are_cached = false;
     app.results_selected = 0;
     app.results_edit = None;
@@ -1862,7 +1926,7 @@ fn render_hint_bar(f: &mut Frame, area: Rect, app: &App) {
                 "[Tab] switch   [←→↑↓] move   [[/]] month   [t] today   [y] yesterday   [space] range   [m] standup   [s] scan"
             }
             Focus::Right => {
-                "[Tab] switch   [↑↓] group   [e] time   [m] standup   [s] scan   [S] rescan   [p] push   [J] Jira"
+                "[Tab] switch   [↑↓] group   [e] time   [m] standup   [s] scan   [S] rescan   [p] push   [G] refresh PRs   [J] Jira"
             }
         }
     };
@@ -1962,12 +2026,21 @@ fn lines_for_summaries(
                 .map(|dt| dt.format("%H:%M").to_string())
                 .unwrap_or_else(|| "--:--".to_string());
             let short = c.oid[..7.min(c.oid.len())].to_string();
+            let pr_suffix = match app.pr_index.get(&c.oid) {
+                Some(prs) if !prs.is_empty() => {
+                    let nums: Vec<String> =
+                        prs.iter().map(|p| format!("#{}", p.number)).collect();
+                    format!("   [PR {}]", nums.join(", "))
+                }
+                _ => String::new(),
+            };
             lines.push(Line::from(format!(
-                "  [{:<w$}]  {}  {}  {}",
+                "  [{:<w$}]  {}  {}  {}{}",
                 c.repo,
                 hm,
                 short,
                 c.subject,
+                pr_suffix,
                 w = repo_w
             )));
             for body_line in c.body.lines() {

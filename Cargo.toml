@@ -1,6 +1,6 @@
 [package]
 name = "dlog"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Personal git -> Jira daily logger (groups commits by ticket, pushes worklogs)"
 license = "MIT"
