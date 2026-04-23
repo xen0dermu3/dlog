@@ -54,7 +54,13 @@ Launches the terminal UI — three columns:
   `[PgUp/PgDn]` scroll page
 
 Global keys: `[Tab]` next pane · `[s]` scan · `[S]` rescan (bypass cache) ·
+`[m]` morning standup · `[p]` push worklogs to Jira · `[J]` Jira settings ·
 `[q]` / `[Esc]` quit.
+
+The standup view (`d`) shows **yesterday's work** (grouped by ticket, with
+hours) plus **today's in-flight** — unpushed commits by you from the last
+7 days across all configured repos, grouped the same way. Use it first thing
+in the morning for your standup call.
 
 Ticket keys are extracted via the regex `[A-Z][A-Z0-9]+-\d+` applied to the
 branch name at HEAD, each commit's subject, and each commit's body. Commits

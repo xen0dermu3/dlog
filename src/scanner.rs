@@ -120,3 +120,111 @@ pub fn scan(
     records.sort_by_key(|r| r.author_time);
     Ok(records)
 }
+
+/// Like `scan`, but only returns commits that are **not yet pushed** — i.e.
+/// reachable from a local branch tip but not from its upstream. Used by the
+/// morning standup view.
+pub fn scan_in_flight(
+    repo_path: &Path,
+    cutoff_date: NaiveDate,
+    end_date_inclusive: NaiveDate,
+) -> Result<Vec<CommitRecord>> {
+    let repo = Repository::open(repo_path)
+        .with_context(|| format!("opening git repo at {}", repo_path.display()))?;
+
+    let repo_name = repo_path
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| repo_path.display().to_string());
+
+    let me = repo
+        .config()?
+        .get_string("user.email")
+        .context("reading user.email from git config")?;
+
+    let start = cutoff_date
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_local_timezone(Local)
+        .single()
+        .context("resolving cutoff start-of-day")?
+        .timestamp();
+    let end = end_date_inclusive
+        .succ_opt()
+        .context("computing day after end")?
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_local_timezone(Local)
+        .single()
+        .context("resolving end-of-day")?
+        .timestamp();
+    let inner_cutoff = start - 24 * 3600;
+
+    let mut branches_by_oid: HashMap<Oid, Vec<String>> = HashMap::new();
+    for branch in repo.branches(Some(BranchType::Local))? {
+        let (branch, _) = branch?;
+        let name = match branch.name()? {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let Some(tip) = branch.get().target() else {
+            continue;
+        };
+        // When the branch has an upstream, hide its tip so the walk yields
+        // only the unpushed ahead-of-upstream commits. Branches without an
+        // upstream emit all their history (subject to the time window).
+        let upstream_tip = branch.upstream().ok().and_then(|u| u.get().target());
+
+        let mut walk = repo.revwalk()?;
+        walk.set_sorting(Sort::TIME)?;
+        walk.push(tip)?;
+        if let Some(up) = upstream_tip {
+            let _ = walk.hide(up);
+        }
+
+        for oid in walk {
+            let oid = oid?;
+            let commit = repo.find_commit(oid)?;
+            let time = commit.time().seconds();
+            if time < inner_cutoff {
+                break;
+            }
+            branches_by_oid.entry(oid).or_default().push(name.clone());
+        }
+    }
+
+    let mut records = Vec::new();
+    for (oid, branches) in &branches_by_oid {
+        let commit = match repo.find_commit(*oid) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if commit.parent_count() > 1 {
+            continue;
+        }
+        let time = commit.time().seconds();
+        if time < start || time >= end {
+            continue;
+        }
+        if commit.author().email() != Some(me.as_str()) {
+            continue;
+        }
+        let msg = commit.message().unwrap_or("");
+        let (subject, body) = match msg.split_once('\n') {
+            Some((s, b)) => (s.trim_end().to_owned(), b.trim().to_owned()),
+            None => (msg.trim().to_owned(), String::new()),
+        };
+        records.push(CommitRecord {
+            oid: oid.to_string(),
+            author_time: time,
+            subject,
+            body,
+            branches: branches.join(" "),
+            repo: repo_name.clone(),
+        });
+    }
+
+    records.sort_by_key(|r| r.author_time);
+    Ok(records)
+}

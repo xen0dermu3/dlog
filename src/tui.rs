@@ -23,6 +23,7 @@ use crate::hours::{format_hours, parse_duration};
 use crate::jira::{self, JiraClient, WorklogOutcome};
 use crate::report::{self, GroupSummary};
 use crate::scanner::{self, CommitRecord};
+use crate::standup::{self, StandupReport};
 use crate::store::Store;
 
 const FUZZY_LIMIT: usize = 8;
@@ -120,6 +121,10 @@ struct App {
     // Persistent store — None if the DB couldn't be opened (fall back to
     // in-memory only).
     store: Option<Store>,
+
+    // Morning standup overlay — when Some, right pane renders the report.
+    standup: Option<StandupReport>,
+    standup_scroll: u16,
 }
 
 impl App {
@@ -167,6 +172,8 @@ impl App {
             jira_client: None,
             pushed_this_session: HashSet::new(),
             store: Store::open().ok(),
+            standup: None,
+            standup_scroll: 0,
         }
     }
 
@@ -306,6 +313,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         handle_push(app, key);
         return Ok(false);
     }
+    if app.standup.is_some() {
+        handle_standup(app, key);
+        return Ok(false);
+    }
     if app.is_adding() {
         handle_add_repo(app, key);
         return Ok(false);
@@ -344,8 +355,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
             }
             return Ok(false);
         }
-        KeyCode::Char('P') => {
+        KeyCode::Char('J') => {
             open_jira_settings(app);
+            return Ok(false);
+        }
+        KeyCode::Char('m') => {
+            open_standup(app);
             return Ok(false);
         }
         _ => {}
@@ -635,6 +650,35 @@ fn do_scan(app: &mut App, force: bool) {
 }
 
 // ---------- push flow -----------------------------------------------------
+
+fn open_standup(app: &mut App) {
+    match standup::build(&app.config, app.today) {
+        Ok(report) => {
+            app.standup = Some(report);
+            app.standup_scroll = 0;
+            app.focus = Focus::Right;
+        }
+        Err(e) => {
+            app.error = Some(format!("standup: {e:#}"));
+        }
+    }
+}
+
+fn handle_standup(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.standup = None;
+            app.standup_scroll = 0;
+        }
+        KeyCode::PageDown => {
+            app.standup_scroll = app.standup_scroll.saturating_add(10);
+        }
+        KeyCode::PageUp => {
+            app.standup_scroll = app.standup_scroll.saturating_sub(10);
+        }
+        _ => {}
+    }
+}
 
 fn open_jira_settings(app: &mut App) {
     let (url, email) = match &app.config.jira {
@@ -1327,15 +1371,21 @@ fn render_middle_pane(f: &mut Frame, area: Rect, app: &App) {
 // ---------- right pane (results) -----------------------------------------
 
 fn render_right_pane(f: &mut Frame, area: Rect, app: &mut App) {
-    let title = match &app.push {
-        Some(PushStage::Setup(s)) if s.editing => " jira settings ",
-        Some(PushStage::Setup(_)) => " push to jira — setup ",
-        Some(PushStage::Preview { .. }) => " push to jira — preview ",
-        Some(PushStage::Sending { .. }) => " push to jira — sending ",
-        Some(PushStage::Result { .. }) => " push to jira — done ",
-        None => " results ",
+    let title = if app.standup.is_some() {
+        " standup "
+    } else {
+        match &app.push {
+            Some(PushStage::Setup(s)) if s.editing => " Jira settings ",
+            Some(PushStage::Setup(_)) => " push to Jira — setup ",
+            Some(PushStage::Preview { .. }) => " push to Jira — preview ",
+            Some(PushStage::Sending { .. }) => " push to Jira — sending ",
+            Some(PushStage::Result { .. }) => " push to Jira — done ",
+            None => " results ",
+        }
     };
-    let border_color = if app.push.is_some() {
+    let border_color = if app.standup.is_some() {
+        Color::Blue
+    } else if app.push.is_some() {
         Color::Magenta
     } else if app.focus == Focus::Right {
         Color::Yellow
@@ -1351,6 +1401,11 @@ fn render_right_pane(f: &mut Frame, area: Rect, app: &mut App) {
 
     if let Some(stage) = &app.push {
         render_push(f, inner, stage);
+        return;
+    }
+
+    if let Some(report) = &app.standup {
+        render_standup(f, inner, report, app.standup_scroll);
         return;
     }
 
@@ -1636,6 +1691,118 @@ fn render_push_result(
     f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
 }
 
+fn render_standup(f: &mut Frame, area: Rect, report: &StandupReport, scroll: u16) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(""));
+
+    // --- Yesterday ---
+    let yesterday_total: f32 = report::group_with_hours(&report.yesterday_records)
+        .iter()
+        .map(|g| g.gap.value)
+        .sum();
+    let header = if report.yesterday_records.is_empty() {
+        format!(
+            "  Yesterday ({}) — nothing committed",
+            report.yesterday.format("%a %b %-d")
+        )
+    } else {
+        format!(
+            "  Yesterday ({}) — {} total",
+            report.yesterday.format("%a %b %-d"),
+            format_hours(yesterday_total)
+        )
+    };
+    lines.push(Line::from(Span::styled(
+        header,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    if !report.yesterday_records.is_empty() {
+        let groups = report::group_with_hours(&report.yesterday_records);
+        for g in &groups {
+            append_ticket_bullet(&mut lines, g, /*unpushed*/ false);
+        }
+    }
+
+    lines.push(Line::from(""));
+
+    // --- Today in-flight ---
+    lines.push(Line::from(Span::styled(
+        if report.in_flight_records.is_empty() {
+            "  Today — nothing in flight, all pushed".to_string()
+        } else {
+            "  Today — in-flight (unpushed)".to_string()
+        },
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    if !report.in_flight_records.is_empty() {
+        let groups = report::group_with_hours(&report.in_flight_records);
+        for g in &groups {
+            append_ticket_bullet(&mut lines, g, /*unpushed*/ true);
+        }
+    }
+
+    let para = Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    f.render_widget(para, area);
+}
+
+/// Render a ticket group as a single natural-language bullet line:
+///   • TP-1042 (1h 35m): scaffold login form, password field, fix flaky test
+/// For in-flight tickets, time is replaced with commit count (those haven't
+/// been pushed, so hours-logged-to-Jira isn't yet meaningful).
+fn append_ticket_bullet(lines: &mut Vec<Line<'static>>, g: &GroupSummary<'_>, unpushed: bool) {
+    let summary = summarise_commits(&g.commits, &g.ticket);
+    let head = if unpushed {
+        let n = g.commits.len();
+        format!("  • {} ({} unpushed): {}", g.ticket, n, summary)
+    } else {
+        format!(
+            "  • {} ({}): {}",
+            g.ticket,
+            g.gap.display(),
+            summary
+        )
+    };
+    lines.push(Line::from(head));
+}
+
+/// Concatenate commit subjects into a comma-separated sentence, stripping the
+/// obvious "TP-1042: " prefix when it matches the ticket we're already under.
+/// Caps at 3 subjects to keep the bullet line short; appends "… (+N more)".
+fn summarise_commits(commits: &[&CommitRecord], ticket: &str) -> String {
+    const MAX: usize = 3;
+    let prefix = format!("{ticket}:");
+    let parts: Vec<String> = commits
+        .iter()
+        .take(MAX)
+        .map(|c| {
+            c.subject
+                .trim_start_matches(prefix.as_str())
+                .trim()
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    let extra = commits.len().saturating_sub(parts.len());
+    if parts.is_empty() {
+        return format!("{} commit{}", commits.len(), if commits.len() == 1 { "" } else { "s" });
+    }
+    if extra > 0 {
+        format!("{}… (+{} more)", parts.join(", "), extra)
+    } else {
+        parts.join(", ")
+    }
+}
+
 fn render_scanning_skeleton(f: &mut Frame, area: Rect, app: &App) {
     let n = app.config.repos.len();
     let (s, e) = app.current_range();
@@ -1671,6 +1838,8 @@ fn render_hint_bar(f: &mut Frame, area: Rect, app: &App) {
         "press any key to dismiss"
     } else if app.scanning {
         "scanning..."
+    } else if app.standup.is_some() {
+        "[PgUp/PgDn] scroll   [Esc] close"
     } else if let Some(stage) = &app.push {
         match stage {
             PushStage::Setup(_) => "type to enter   [Enter] next   [Esc] cancel",
@@ -1687,13 +1856,13 @@ fn render_hint_bar(f: &mut Frame, area: Rect, app: &App) {
     } else {
         match app.focus {
             Focus::Left => {
-                "[Tab] switch   [a] add   [x] remove   [s] scan   [p] push   [P] jira settings   [q] quit"
+                "[Tab] switch   [a] add   [x] remove   [s] scan   [m] standup   [p] push   [q] quit"
             }
             Focus::Middle => {
-                "[Tab] switch   [←→↑↓] move   [[/]] month   [t] today   [y] yesterday   [space] range   [s] scan   [p] push"
+                "[Tab] switch   [←→↑↓] move   [[/]] month   [t] today   [y] yesterday   [space] range   [m] standup   [s] scan"
             }
             Focus::Right => {
-                "[Tab] switch   [↑↓] group   [e] change time   [s] scan   [S] rescan   [p] push   [P] jira settings"
+                "[Tab] switch   [↑↓] group   [e] time   [m] standup   [s] scan   [S] rescan   [p] push   [J] Jira"
             }
         }
     };

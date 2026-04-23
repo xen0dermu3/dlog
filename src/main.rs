@@ -4,6 +4,7 @@ mod hours;
 mod jira;
 mod report;
 mod scanner;
+mod standup;
 mod store;
 mod tickets;
 mod tui;
