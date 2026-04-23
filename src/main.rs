@@ -1,8 +1,10 @@
+mod bitbucket;
 mod config;
 mod fuzzy;
 mod github;
 mod hours;
 mod jira;
+mod pr;
 mod report;
 mod scanner;
 mod standup;

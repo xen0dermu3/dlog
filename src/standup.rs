@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::{Duration, NaiveDate};
 
 use crate::config::Config;
-use crate::github::{PrInfo, PrState};
+use crate::pr::{PrInfo, PrState};
 use crate::jira::{IssueInfo, JiraClient};
 use crate::scanner::{self, CommitRecord};
 

@@ -12,7 +12,17 @@ pub struct Config {
     #[serde(default)]
     pub jira: Option<JiraConfig>,
     #[serde(default)]
+    pub bitbucket: Option<BitbucketConfig>,
+    #[serde(default)]
     pub estimation: EstimationConfig,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BitbucketConfig {
+    /// Atlassian-account email used for Bitbucket Cloud basic auth.
+    /// App password is stored separately in the OS keyring under service
+    /// "dlog-bitbucket".
+    pub email: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

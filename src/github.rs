@@ -4,25 +4,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PrState {
-    Open,
-    Merged,
-    Closed,
-}
-
-#[derive(Clone, Debug)]
-pub struct PrInfo {
-    pub number: u64,
-    pub title: String,
-    pub body: String,
-    pub head_branch: String,
-    #[allow(dead_code)] // exposed for future "open PR in browser" action
-    pub url: String,
-    #[allow(dead_code)] // exposed for future merged/open filtering
-    pub state: PrState,
-    pub commit_oids: Vec<String>,
-}
+use crate::pr::{PrInfo, PrState};
 
 /// Cheap check: does this repo's `origin` remote look like GitHub?
 /// Returns false for any error (missing repo, no origin, non-github host).

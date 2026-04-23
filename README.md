@@ -77,6 +77,7 @@ budget_default_hours = 8.0  # pre-fill for the [f] button
 
 Global keys: `[Tab]` next pane · `[s]` scan · `[S]` rescan (bypass cache) ·
 `[m]` morning standup · `[p]` push worklogs to Jira · `[J]` Jira settings ·
+`[B]` Bitbucket settings ·
 `[q]` / `[Esc]` quit.
 
 The standup view (`m`) shows three sections:

@@ -19,7 +19,8 @@ use ratatui::{Frame, Terminal};
 
 use crate::config::{Config, JiraConfig};
 use crate::fuzzy::{self, FuzzyIndex};
-use crate::github::{self, PrInfo};
+use crate::github;
+use crate::pr::PrInfo;
 use crate::hours::{format_hours, parse_duration};
 use crate::jira::{self, JiraClient, WorklogOutcome};
 use crate::report::{self, GroupSummary};
@@ -94,6 +95,19 @@ enum FillStage {
     },
 }
 
+enum BbSetupStep {
+    Email,
+    Token,
+}
+
+struct BbSetupState {
+    step: BbSetupStep,
+    email: String,
+    password: String,
+    error: Option<String>,
+    editing: bool,
+}
+
 enum PushStage {
     Setup(SetupState),
     Preview {
@@ -161,6 +175,9 @@ struct App {
 
     // Budget-split flow (`f` key). Right-pane takeover while Some.
     fill: Option<FillStage>,
+
+    // Bitbucket settings flow (`Shift+B`). Separate from Jira setup.
+    bb_setup: Option<BbSetupState>,
 }
 
 impl App {
@@ -212,6 +229,7 @@ impl App {
             standup_scroll: 0,
             pr_index: HashMap::new(),
             fill: None,
+            bb_setup: None,
         }
     }
 
@@ -355,6 +373,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         handle_fill(app, key);
         return Ok(false);
     }
+    if app.bb_setup.is_some() {
+        handle_bb_setup(app, key);
+        return Ok(false);
+    }
     if app.standup.is_some() {
         handle_standup(app, key);
         return Ok(false);
@@ -411,6 +433,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         }
         KeyCode::Char('f') => {
             open_fill(app);
+            return Ok(false);
+        }
+        KeyCode::Char('B') => {
+            open_bb_settings(app);
             return Ok(false);
         }
         _ => {}
@@ -889,14 +915,22 @@ fn allocate_fill_budget(
     mins.into_iter().map(|m| m as f32 / 60.0).collect()
 }
 
-fn build_pr_index(repos: &[PathBuf]) -> HashMap<String, Vec<PrInfo>> {
+fn build_pr_index(config: &Config) -> HashMap<String, Vec<PrInfo>> {
     let mut idx: HashMap<String, Vec<PrInfo>> = HashMap::new();
-    for path in repos {
-        if github::is_github_repo(path) {
-            for pr in github::fetch_prs(path) {
-                for oid in &pr.commit_oids {
-                    idx.entry(oid.clone()).or_default().push(pr.clone());
-                }
+    for path in &config.repos {
+        let prs: Vec<PrInfo> = if github::is_github_repo(path) {
+            github::fetch_prs(path)
+        } else if crate::bitbucket::is_bitbucket_repo(path) {
+            match &config.bitbucket {
+                Some(cfg) => crate::bitbucket::fetch_prs(path, cfg),
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        for pr in prs {
+            for oid in &pr.commit_oids {
+                idx.entry(oid.clone()).or_default().push(pr.clone());
             }
         }
     }
@@ -929,7 +963,7 @@ fn enrich_records_with_prs(
 }
 
 fn refresh_github_prs(app: &mut App) {
-    let idx = build_pr_index(&app.config.repos);
+    let idx = build_pr_index(&app.config);
     enrich_records_with_prs(&mut app.scan_records, &idx);
     app.pr_index = idx;
 }
@@ -974,6 +1008,82 @@ fn handle_standup(app: &mut App, key: KeyEvent) {
         KeyCode::PageUp => {
             app.standup_scroll = app.standup_scroll.saturating_sub(10);
         }
+        _ => {}
+    }
+}
+
+// ---------- Bitbucket settings ------------------------------------------
+
+fn open_bb_settings(app: &mut App) {
+    let email = match &app.config.bitbucket {
+        Some(c) => c.email.clone(),
+        None => String::new(),
+    };
+    app.bb_setup = Some(BbSetupState {
+        step: BbSetupStep::Email,
+        email,
+        password: String::new(),
+        error: None,
+        editing: app.config.bitbucket.is_some(),
+    });
+    app.focus = Focus::Right;
+}
+
+fn handle_bb_setup(app: &mut App, key: KeyEvent) {
+    let Some(state) = &mut app.bb_setup else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.bb_setup = None;
+        }
+        KeyCode::Enter => match state.step {
+            BbSetupStep::Email => {
+                let v = state.email.trim();
+                if !v.contains('@') {
+                    state.error = Some("not an email address".into());
+                    return;
+                }
+                state.email = v.to_string();
+                state.step = BbSetupStep::Token;
+                state.error = None;
+            }
+            BbSetupStep::Token => {
+                if state.password.is_empty() {
+                    if !state.editing {
+                        state.error = Some("app password is empty".into());
+                        return;
+                    }
+                    // Editing + empty = keep existing token in Keychain.
+                } else if let Err(e) =
+                    crate::bitbucket::save_token(&state.email, &state.password)
+                {
+                    state.error = Some(format!("keyring: {e:#}"));
+                    return;
+                }
+                app.config.bitbucket = Some(crate::config::BitbucketConfig {
+                    email: state.email.clone(),
+                });
+                if let Err(e) = app.config.save() {
+                    app.error = Some(format!("save config: {e:#}"));
+                    app.bb_setup = None;
+                    return;
+                }
+                app.bb_setup = None;
+            }
+        },
+        KeyCode::Backspace => match state.step {
+            BbSetupStep::Email => {
+                state.email.pop();
+            }
+            BbSetupStep::Token => {
+                state.password.pop();
+            }
+        },
+        KeyCode::Char(c) => match state.step {
+            BbSetupStep::Email => state.email.push(c),
+            BbSetupStep::Token => state.password.push(c),
+        },
         _ => {}
     }
 }
@@ -1324,7 +1434,7 @@ fn run_scan(app: &mut App) {
     // Pull GitHub PR metadata for all configured github repos, then enrich
     // each commit's `branches` string with PR title/body/head-branch text so
     // ticket extraction catches keys that only appear in the PR.
-    let pr_index = build_pr_index(&app.config.repos);
+    let pr_index = build_pr_index(&app.config);
     enrich_records_with_prs(&mut all, &pr_index);
 
     let key = cache_key(start, end, &app.config.repos);
@@ -1704,7 +1814,9 @@ fn render_middle_pane(f: &mut Frame, area: Rect, app: &App) {
 // ---------- right pane (results) -----------------------------------------
 
 fn render_right_pane(f: &mut Frame, area: Rect, app: &mut App) {
-    let title = if app.standup.is_some() {
+    let title = if app.bb_setup.is_some() {
+        " Bitbucket settings "
+    } else if app.standup.is_some() {
         " standup "
     } else if app.fill.is_some() {
         match &app.fill {
@@ -1722,7 +1834,9 @@ fn render_right_pane(f: &mut Frame, area: Rect, app: &mut App) {
             None => " results ",
         }
     };
-    let border_color = if app.standup.is_some() {
+    let border_color = if app.bb_setup.is_some() {
+        Color::Magenta
+    } else if app.standup.is_some() {
         Color::Blue
     } else if app.fill.is_some() {
         Color::LightGreen
@@ -1752,6 +1866,11 @@ fn render_right_pane(f: &mut Frame, area: Rect, app: &mut App) {
 
     if let Some(stage) = &app.fill {
         render_fill(f, inner, stage, &app.config.estimation);
+        return;
+    }
+
+    if let Some(state) = &app.bb_setup {
+        render_bb_setup(f, inner, state);
         return;
     }
 
@@ -2184,6 +2303,54 @@ fn summarise_commits(commits: &[&CommitRecord], ticket: &str) -> String {
     }
 }
 
+fn render_bb_setup(f: &mut Frame, area: Rect, state: &BbSetupState) {
+    let (label, current, mask) = match state.step {
+        BbSetupStep::Email => ("step 1/2: Atlassian email", &state.email, false),
+        BbSetupStep::Token => ("step 2/2: app password", &state.password, true),
+    };
+    let display = if mask {
+        "*".repeat(current.chars().count())
+    } else {
+        current.clone()
+    };
+    let title_prefix = if state.editing { "editing" } else { "setup" };
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {title_prefix} — {label}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!("  > {display}_")),
+        Line::from(""),
+    ];
+    if let Some(err) = &state.error {
+        lines.push(Line::from(Span::styled(
+            format!("  {err}"),
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::from(""));
+    }
+    let hint = match state.step {
+        BbSetupStep::Email => "  e.g. you@example.com (your Atlassian account email)",
+        BbSetupStep::Token => {
+            if state.editing {
+                "  create at bitbucket.org → Personal settings → App passwords (scope: pullrequest:read).  empty = keep current."
+            } else {
+                "  create at bitbucket.org → Personal settings → App passwords (scope: pullrequest:read).  saved to Keychain."
+            }
+        }
+    };
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn render_fill(
     f: &mut Frame,
     area: Rect,
@@ -2328,6 +2495,8 @@ fn render_hint_bar(f: &mut Frame, area: Rect, app: &App) {
         "scanning..."
     } else if app.standup.is_some() {
         "[PgUp/PgDn] scroll   [Esc] close"
+    } else if app.bb_setup.is_some() {
+        "type to enter   [Enter] next   [Esc] cancel"
     } else if let Some(stage) = &app.fill {
         match stage {
             FillStage::Input { .. } => "type budget (e.g. 8h)   [Enter] next   [Esc] cancel",
@@ -2357,7 +2526,7 @@ fn render_hint_bar(f: &mut Frame, area: Rect, app: &App) {
                 "[Tab] switch   [←→↑↓] move   [[/]] month   [t] today   [y] yesterday   [space] range   [m] standup   [s] scan"
             }
             Focus::Right => {
-                "[Tab] switch   [↑↓] group   [e] time   [f] fill budget   [m] standup   [s] scan   [S] rescan   [p] push   [G] PRs   [J] Jira"
+                "[Tab] switch   [↑↓] group   [e] time   [f] fill   [m] standup   [s] scan   [S] rescan   [p] push   [G] PRs   [J] Jira   [B] Bitbucket"
             }
         }
     };
