@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use chrono::{Datelike, Local, NaiveDate, TimeZone};
+use chrono::{Datelike, DateTime, FixedOffset, Local, NaiveDate, TimeZone};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -17,9 +17,10 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
-use crate::config::Config;
+use crate::config::{Config, JiraConfig};
 use crate::fuzzy::{self, FuzzyIndex};
 use crate::hours::{format_hours, parse_duration};
+use crate::jira::{self, JiraClient, WorklogOutcome};
 use crate::report::{self, GroupSummary};
 use crate::scanner::{self, CommitRecord};
 
@@ -37,6 +38,47 @@ enum Focus {
 enum LeftMode {
     Browse,
     AddRepo { error: Option<String> },
+}
+
+#[derive(Clone)]
+struct PushItem {
+    ticket: String,
+    seconds: u64,
+    started: DateTime<FixedOffset>,
+}
+
+enum SetupStep {
+    Url,
+    Email,
+    Token,
+}
+
+struct SetupState {
+    step: SetupStep,
+    url: String,
+    email: String,
+    token: String,
+    error: Option<String>,
+    /// True when invoked from `P` (edit existing settings) vs `p` first-run.
+    editing: bool,
+}
+
+enum PushStage {
+    Setup(SetupState),
+    Preview {
+        items: Vec<PushItem>,
+        checks: Vec<bool>,
+        cursor: usize,
+    },
+    Sending {
+        queue: Vec<PushItem>,
+        done: Vec<String>,
+        failed: Vec<(String, String)>,
+    },
+    Result {
+        done: Vec<String>,
+        failed: Vec<(String, String)>,
+    },
 }
 
 struct App {
@@ -67,6 +109,11 @@ struct App {
     results_edit: Option<String>,
     results_scroll: u16,
     hours_overrides: HashMap<String, f32>,
+
+    // Push-to-Jira state
+    push: Option<PushStage>,
+    jira_client: Option<JiraClient>,
+    pushed_this_session: HashSet<String>,
 }
 
 impl App {
@@ -104,6 +151,9 @@ impl App {
             results_edit: None,
             results_scroll: 0,
             hours_overrides: HashMap::new(),
+            push: None,
+            jira_client: None,
+            pushed_this_session: HashSet::new(),
         }
     }
 
@@ -199,6 +249,11 @@ fn event_loop<B: ratatui::backend::Backend>(
             continue;
         }
 
+        if matches!(app.push, Some(PushStage::Sending { .. })) {
+            step_push(app);
+            continue;
+        }
+
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
@@ -221,6 +276,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         return Ok(false);
     }
     if app.scanning {
+        return Ok(false);
+    }
+    if app.push.is_some() {
+        handle_push(app, key);
         return Ok(false);
     }
     if app.is_adding() {
@@ -248,6 +307,21 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         }
         KeyCode::Char('S') => {
             do_scan(app, true);
+            return Ok(false);
+        }
+        KeyCode::Char('p') => {
+            start_push(app);
+            return Ok(false);
+        }
+        KeyCode::Char('e') => {
+            if !app.scan_records.is_empty() {
+                app.focus = Focus::Right;
+                app.results_edit = Some(String::new());
+            }
+            return Ok(false);
+        }
+        KeyCode::Char('P') => {
+            open_jira_settings(app);
             return Ok(false);
         }
         _ => {}
@@ -356,11 +430,6 @@ fn handle_right(app: &mut App, key: KeyEvent) {
             let n = report::group_with_hours(&app.scan_records).len();
             if n > 0 {
                 app.results_selected = (app.results_selected + n - 1) % n;
-            }
-        }
-        KeyCode::Char('e') => {
-            if !app.scan_records.is_empty() {
-                app.results_edit = Some(String::new());
             }
         }
         KeyCode::PageDown => {
@@ -511,6 +580,291 @@ fn do_scan(app: &mut App, force: bool) {
     }
     app.scanning = true;
     app.focus = Focus::Right;
+}
+
+// ---------- push flow -----------------------------------------------------
+
+fn open_jira_settings(app: &mut App) {
+    let (url, email) = match &app.config.jira {
+        Some(c) => (c.base_url.clone(), c.email.clone()),
+        None => (String::new(), String::new()),
+    };
+    app.push = Some(PushStage::Setup(SetupState {
+        step: SetupStep::Url,
+        url,
+        email,
+        token: String::new(),
+        error: None,
+        editing: true,
+    }));
+}
+
+fn start_push(app: &mut App) {
+    if app.scan_records.is_empty() {
+        app.error = Some("Nothing to push — run a scan first.".into());
+        return;
+    }
+    match &app.config.jira {
+        None => {
+            app.push = Some(PushStage::Setup(SetupState {
+                step: SetupStep::Url,
+                url: String::new(),
+                email: String::new(),
+                token: String::new(),
+                error: None,
+                editing: false,
+            }));
+        }
+        Some(cfg) => {
+            if app.jira_client.is_none() {
+                match JiraClient::from_config(cfg) {
+                    Ok(client) => app.jira_client = Some(client),
+                    Err(e) => {
+                        app.error = Some(format!("Jira: {e:#}"));
+                        return;
+                    }
+                }
+            }
+            open_preview(app);
+        }
+    }
+}
+
+fn open_preview(app: &mut App) {
+    let items = build_push_items(app);
+    if items.is_empty() {
+        app.error = Some(
+            "Nothing to push — all tickets round to 0 minutes or are untagged.".into(),
+        );
+        return;
+    }
+    let checks = items
+        .iter()
+        .map(|it| !app.pushed_this_session.contains(&it.ticket))
+        .collect();
+    app.push = Some(PushStage::Preview {
+        items,
+        checks,
+        cursor: 0,
+    });
+}
+
+fn build_push_items(app: &App) -> Vec<PushItem> {
+    let groups = report::group_with_hours(&app.scan_records);
+    groups
+        .into_iter()
+        .filter(|g| g.ticket != report::UNTAGGED)
+        .filter_map(|g| {
+            let hours = app
+                .hours_overrides
+                .get(&g.ticket)
+                .copied()
+                .unwrap_or(g.gap.value);
+            let seconds = jira::hours_to_jira_seconds(hours);
+            if seconds == 0 {
+                return None;
+            }
+            let first_commit = g.commits.iter().min_by_key(|c| c.author_time)?;
+            let local = Local.timestamp_opt(first_commit.author_time, 0).single()?;
+            Some(PushItem {
+                ticket: g.ticket,
+                seconds,
+                started: local.fixed_offset(),
+            })
+        })
+        .collect()
+}
+
+fn handle_push(app: &mut App, key: KeyEvent) {
+    match &mut app.push {
+        Some(PushStage::Setup(_)) => handle_push_setup(app, key),
+        Some(PushStage::Preview { .. }) => handle_push_preview(app, key),
+        Some(PushStage::Sending { .. }) => {
+            // Sending ignores input; progress is driven by event_loop.
+        }
+        Some(PushStage::Result { .. }) => {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                app.push = None;
+            }
+        }
+        None => {}
+    }
+}
+
+fn handle_push_setup(app: &mut App, key: KeyEvent) {
+    let Some(PushStage::Setup(state)) = &mut app.push else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.push = None;
+        }
+        KeyCode::Enter => {
+            match state.step {
+                SetupStep::Url => {
+                    let v = state.url.trim();
+                    if !(v.starts_with("http://") || v.starts_with("https://")) {
+                        state.error = Some("URL must start with http:// or https://".into());
+                        return;
+                    }
+                    state.url = v.to_string();
+                    state.step = SetupStep::Email;
+                    state.error = None;
+                }
+                SetupStep::Email => {
+                    let v = state.email.trim();
+                    if !v.contains('@') {
+                        state.error = Some("not an email address".into());
+                        return;
+                    }
+                    state.email = v.to_string();
+                    state.step = SetupStep::Token;
+                    state.error = None;
+                }
+                SetupStep::Token => {
+                    if state.token.is_empty() {
+                        if !state.editing {
+                            state.error = Some("token is empty".into());
+                            return;
+                        }
+                        // Editing + empty token = keep existing token in Keychain.
+                    } else if let Err(e) = jira::save_token(&state.email, &state.token) {
+                        state.error = Some(format!("keyring: {e:#}"));
+                        return;
+                    }
+                    let cfg = JiraConfig {
+                        base_url: state.url.clone(),
+                        email: state.email.clone(),
+                    };
+                    let editing = state.editing;
+                    app.config.jira = Some(cfg.clone());
+                    if let Err(e) = app.config.save() {
+                        app.error = Some(format!("save config: {e:#}"));
+                        app.push = None;
+                        return;
+                    }
+                    match JiraClient::from_config(&cfg) {
+                        Ok(client) => {
+                            app.jira_client = Some(client);
+                            if editing {
+                                app.push = None;
+                            } else {
+                                open_preview(app);
+                            }
+                        }
+                        Err(e) => {
+                            app.error = Some(format!("Jira: {e:#}"));
+                            app.push = None;
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Backspace => match state.step {
+            SetupStep::Url => {
+                state.url.pop();
+            }
+            SetupStep::Email => {
+                state.email.pop();
+            }
+            SetupStep::Token => {
+                state.token.pop();
+            }
+        },
+        KeyCode::Char(c) => match state.step {
+            SetupStep::Url => state.url.push(c),
+            SetupStep::Email => state.email.push(c),
+            SetupStep::Token => state.token.push(c),
+        },
+        _ => {}
+    }
+}
+
+fn handle_push_preview(app: &mut App, key: KeyEvent) {
+    let Some(PushStage::Preview {
+        items,
+        checks,
+        cursor,
+    }) = &mut app.push
+    else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.push = None;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if !items.is_empty() {
+                *cursor = (*cursor + items.len() - 1) % items.len();
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !items.is_empty() {
+                *cursor = (*cursor + 1) % items.len();
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some(c) = checks.get_mut(*cursor) {
+                *c = !*c;
+            }
+        }
+        KeyCode::Enter => {
+            let queue: Vec<PushItem> = items
+                .iter()
+                .zip(checks.iter())
+                .filter(|(_, c)| **c)
+                .map(|(it, _)| it.clone())
+                .collect();
+            if queue.is_empty() {
+                // No-op; stay in preview.
+                return;
+            }
+            app.push = Some(PushStage::Sending {
+                queue,
+                done: Vec::new(),
+                failed: Vec::new(),
+            });
+        }
+        _ => {}
+    }
+}
+
+fn step_push(app: &mut App) {
+    let Some(PushStage::Sending {
+        queue,
+        done,
+        failed,
+    }) = &mut app.push
+    else {
+        return;
+    };
+    if queue.is_empty() {
+        let finished_done = std::mem::take(done);
+        let finished_failed = std::mem::take(failed);
+        app.push = Some(PushStage::Result {
+            done: finished_done,
+            failed: finished_failed,
+        });
+        return;
+    }
+    let item = queue.remove(0);
+    let Some(client) = &app.jira_client else {
+        app.error = Some("Jira client missing.".into());
+        app.push = None;
+        return;
+    };
+    match client.post_worklog(&item.ticket, item.started, item.seconds) {
+        Ok(WorklogOutcome::Ok { .. }) => {
+            app.pushed_this_session.insert(item.ticket.clone());
+            done.push(item.ticket);
+        }
+        Ok(WorklogOutcome::Err { status, message }) => {
+            failed.push((item.ticket, format!("HTTP {status}: {message}")));
+        }
+        Err(e) => {
+            failed.push((item.ticket, format!("{e:#}")));
+        }
+    }
 }
 
 fn run_scan(app: &mut App) {
@@ -886,12 +1240,32 @@ fn render_middle_pane(f: &mut Frame, area: Rect, app: &App) {
 // ---------- right pane (results) -----------------------------------------
 
 fn render_right_pane(f: &mut Frame, area: Rect, app: &mut App) {
+    let title = match &app.push {
+        Some(PushStage::Setup(s)) if s.editing => " jira settings ",
+        Some(PushStage::Setup(_)) => " push to jira — setup ",
+        Some(PushStage::Preview { .. }) => " push to jira — preview ",
+        Some(PushStage::Sending { .. }) => " push to jira — sending ",
+        Some(PushStage::Result { .. }) => " push to jira — done ",
+        None => " results ",
+    };
+    let border_color = if app.push.is_some() {
+        Color::Magenta
+    } else if app.focus == Focus::Right {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(focused_border(app.focus, Focus::Right))
-        .title(" results ");
+        .border_style(Style::default().fg(border_color))
+        .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    if let Some(stage) = &app.push {
+        render_push(f, inner, stage);
+        return;
+    }
 
     if app.scanning {
         render_scanning_skeleton(f, inner, app);
@@ -955,6 +1329,225 @@ fn render_right_pane(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(para, inner);
 }
 
+fn render_push(f: &mut Frame, area: Rect, stage: &PushStage) {
+    match stage {
+        PushStage::Setup(state) => render_push_setup(f, area, state),
+        PushStage::Preview {
+            items,
+            checks,
+            cursor,
+        } => render_push_preview(f, area, items, checks, *cursor),
+        PushStage::Sending { queue, done, failed } => {
+            render_push_sending(f, area, queue, done, failed)
+        }
+        PushStage::Result { done, failed } => render_push_result(f, area, done, failed),
+    }
+}
+
+fn render_push_setup(f: &mut Frame, area: Rect, state: &SetupState) {
+    let (step_label, current) = match state.step {
+        SetupStep::Url => ("step 1/3: base URL", &state.url),
+        SetupStep::Email => ("step 2/3: email", &state.email),
+        SetupStep::Token => ("step 3/3: API token", &state.token),
+    };
+    let display: String = match state.step {
+        SetupStep::Token => "*".repeat(current.chars().count()),
+        _ => current.clone(),
+    };
+    let title_prefix = if state.editing {
+        "editing"
+    } else {
+        "setup"
+    };
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {title_prefix} — {step_label}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!("  > {display}_")),
+        Line::from(""),
+    ];
+    if let Some(err) = &state.error {
+        lines.push(Line::from(Span::styled(
+            format!("  {err}"),
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::from(""));
+    }
+    let hint = match state.step {
+        SetupStep::Url => "  e.g. https://mycompany.atlassian.net",
+        SetupStep::Email => "  e.g. you@example.com",
+        SetupStep::Token => {
+            if state.editing {
+                "  create at id.atlassian.com → Security → API tokens.  empty = keep current."
+            } else {
+                "  create at id.atlassian.com → Security → API tokens.  saved to Keychain."
+            }
+        }
+    };
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(Color::DarkGray),
+    )));
+    if !state.url.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  url:   {}", state.url),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    if !state.email.is_empty() && !matches!(state.step, SetupStep::Email) {
+        lines.push(Line::from(Span::styled(
+            format!("  email: {}", state.email),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
+}
+
+fn render_push_preview(
+    f: &mut Frame,
+    area: Rect,
+    items: &[PushItem],
+    checks: &[bool],
+    cursor: usize,
+) {
+    let mut lines: Vec<Line> = vec![Line::from("")];
+    let mut selected_total: u64 = 0;
+    let mut selected_count = 0usize;
+
+    for (i, (item, &checked)) in items.iter().zip(checks.iter()).enumerate() {
+        let marker = if i == cursor { "> " } else { "  " };
+        let box_mark = if checked { "[x]" } else { "[ ]" };
+        let hours = item.seconds as f32 / 3600.0;
+        let started = item.started.format("%Y-%m-%d %H:%M").to_string();
+        let text = format!(
+            "{marker}{box_mark}  {}  —  {}   (start {})",
+            item.ticket,
+            format_hours(hours),
+            started
+        );
+        let style = if i == cursor {
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else if !checked {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+        if checked {
+            selected_total += item.seconds;
+            selected_count += 1;
+        }
+    }
+
+    lines.push(Line::from(""));
+    let total_h = selected_total as f32 / 3600.0;
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {} of {} ticket{} — total {}",
+            selected_count,
+            items.len(),
+            if items.len() == 1 { "" } else { "s" },
+            format_hours(total_h)
+        ),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
+}
+
+fn render_push_sending(
+    f: &mut Frame,
+    area: Rect,
+    queue: &[PushItem],
+    done: &[String],
+    failed: &[(String, String)],
+) {
+    let completed = done.len() + failed.len();
+    let total = completed + queue.len();
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  posting worklogs: {}/{}", completed, total),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for t in done {
+        lines.push(Line::from(Span::styled(
+            format!("  ✓ {t}"),
+            Style::default().fg(Color::Green),
+        )));
+    }
+    for (t, e) in failed {
+        lines.push(Line::from(Span::styled(
+            format!("  ✗ {t}  ({e})"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if let Some(next) = queue.first() {
+        lines.push(Line::from(Span::styled(
+            format!("  … {}", next.ticket),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
+}
+
+fn render_push_result(
+    f: &mut Frame,
+    area: Rect,
+    done: &[String],
+    failed: &[(String, String)],
+) {
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "  done: {} succeeded, {} failed",
+                done.len(),
+                failed.len()
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for t in done {
+        lines.push(Line::from(Span::styled(
+            format!("  ✓ {t}"),
+            Style::default().fg(Color::Green),
+        )));
+    }
+    if !failed.is_empty() {
+        lines.push(Line::from(""));
+        for (t, e) in failed {
+            lines.push(Line::from(Span::styled(
+                format!("  ✗ {t}"),
+                Style::default().fg(Color::Red),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("      {e}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  press Enter or Esc to return",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
+}
+
 fn render_scanning_skeleton(f: &mut Frame, area: Rect, app: &App) {
     let n = app.config.repos.len();
     let (s, e) = app.current_range();
@@ -986,10 +1579,19 @@ fn render_scanning_skeleton(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_hint_bar(f: &mut Frame, area: Rect, app: &App) {
-    let text = if app.error.is_some() {
+    let text: &str = if app.error.is_some() {
         "press any key to dismiss"
     } else if app.scanning {
         "scanning..."
+    } else if let Some(stage) = &app.push {
+        match stage {
+            PushStage::Setup(_) => "type to enter   [Enter] next   [Esc] cancel",
+            PushStage::Preview { .. } => {
+                "[↑↓] select   [space] toggle   [Enter] push   [Esc] cancel"
+            }
+            PushStage::Sending { .. } => "posting...",
+            PushStage::Result { .. } => "press [Enter] or [Esc] to return",
+        }
     } else if app.is_adding() {
         "type to filter   [↑/↓] pick   [Enter] add   [Esc] cancel"
     } else if app.focus == Focus::Right && app.results_edit.is_some() {
@@ -997,13 +1599,13 @@ fn render_hint_bar(f: &mut Frame, area: Rect, app: &App) {
     } else {
         match app.focus {
             Focus::Left => {
-                "[Tab] next pane   [↑↓] select   [a] add   [x] remove   [s] scan   [q] quit"
+                "[Tab] switch   [a] add   [x] remove   [s] scan   [p] push   [P] jira settings   [q] quit"
             }
             Focus::Middle => {
-                "[Tab] next pane   [←/→/↑/↓] move   [ []/] month   [t] today   [y] yesterday   [space] range   [s] scan"
+                "[Tab] switch   [←→↑↓] move   [[/]] month   [t] today   [y] yesterday   [space] range   [s] scan   [p] push"
             }
             Focus::Right => {
-                "[Tab] next pane   [↑↓] group   [e] change time   [s] scan   [S] rescan   [q] quit"
+                "[Tab] switch   [↑↓] group   [e] change time   [s] scan   [S] rescan   [p] push   [P] jira settings"
             }
         }
     };
@@ -1041,10 +1643,15 @@ fn lines_for_summaries(
         let marker = if selected { "> " } else { "  " };
         let n = g.commits.len();
 
+        let pushed_badge = if app.pushed_this_session.contains(&g.ticket) {
+            " ✓"
+        } else {
+            ""
+        };
         let (header_text, value) = if selected && app.results_edit.is_some() {
             let buf = app.results_edit.as_deref().unwrap_or("");
             (
-                format!("{marker}{} — edit: {buf}_", g.ticket),
+                format!("{marker}{}{pushed_badge} — edit: {buf}_", g.ticket),
                 app.hours_overrides
                     .get(&g.ticket)
                     .copied()
@@ -1053,7 +1660,7 @@ fn lines_for_summaries(
         } else if let Some(ov) = app.hours_overrides.get(&g.ticket) {
             (
                 format!(
-                    "{marker}{} — {} (manual)",
+                    "{marker}{}{pushed_badge} — {} (manual)",
                     g.ticket,
                     format_hours(*ov)
                 ),
@@ -1061,13 +1668,19 @@ fn lines_for_summaries(
             )
         } else {
             (
-                format!("{marker}{} — {}", g.ticket, g.gap.display()),
+                format!("{marker}{}{pushed_badge} — {}", g.ticket, g.gap.display()),
                 g.gap.value,
             )
         };
         total += value;
 
-        let header_style = if selected {
+        let editing = selected && app.results_edit.is_some();
+        let header_style = if editing {
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else if selected {
             Style::default()
                 .bg(Color::DarkGray)
                 .fg(Color::White)

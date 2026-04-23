@@ -42,7 +42,7 @@ dlog
 Launches the terminal UI — three columns:
 
 - **Repos** (left) — the list of git repos to scan. Config persists to
-  `~/Library/Application Support/dlog/config.toml`.
+  `~/.dlog/config.toml`.
   `[a]` add (with fuzzy finder) · `[x]` remove · `[↑/↓]` select
 - **Date** (middle) — always-visible calendar.
   `[←/→/↑/↓]` move cursor · `[[ / ]]` change month · `[t]` today · `[y]` yesterday

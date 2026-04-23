@@ -1,6 +1,7 @@
 mod config;
 mod fuzzy;
 mod hours;
+mod jira;
 mod report;
 mod scanner;
 mod tickets;
